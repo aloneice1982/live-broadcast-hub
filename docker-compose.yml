@@ -1,0 +1,87 @@
+version: '3.9'
+
+# =============================================================
+# 苏超联赛全省直播分发中台
+# 三个容器：Frontend (Nginx) | Backend (Go) | SRS (流媒体核心)
+# =============================================================
+
+services:
+  # -----------------------------------------------------------
+  # SRS 流媒体服务器 — 核心流交换节点
+  # 角色：接受后端 FFmpeg 注入，对外提供 RTMP 拉取点
+  # -----------------------------------------------------------
+  srs:
+    image: ossrs/srs:5
+    container_name: susuper-srs
+    restart: unless-stopped
+    ports:
+      - "1935:1935"   # RTMP 推流/拉流（FFmpeg 使用）
+      - "1985:1985"   # SRS HTTP API（后端调用）
+      - "8088:8080"   # SRS HTTP 播放 / HLS（可选调试）
+    volumes:
+      - ./srs/conf/srs.conf:/usr/local/srs/conf/srs.conf:ro
+      - srs_dvr:/usr/local/srs/objs/nginx/html    # 可选 HLS 落地
+    command: ./objs/srs -c /usr/local/srs/conf/srs.conf
+
+  # -----------------------------------------------------------
+  # Go 后端服务
+  # 提供 REST API、管理 FFmpeg 子进程、调度时间轴任务
+  # -----------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: susuper-backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/uploads:/app/data/uploads      # 原始上传文件
+      - ./data/transcoded:/app/data/transcoded  # 转码后的标准化文件
+      - ./data/db:/app/data/db                # SQLite 数据库文件
+      - /proc/net/dev:/host/proc/net/dev:ro
+    environment:
+      - SRS_HOST=srs                          # 容器内访问 SRS 用服务名
+      - SRS_RTMP_PORT=1935
+      - SRS_API_PORT=1985
+      - DB_PATH=/app/data/db/susuper.db
+      - UPLOAD_DIR=/app/data/uploads
+      - TRANSCODE_DIR=/app/data/transcoded
+      # FFmpeg 并发转码限制（避免 VPS CPU 打满）
+      - TRANSCODE_CONCURRENCY=2
+      # 熔断阈值
+      - FFMPEG_MAX_RETRIES=3
+      - FFMPEG_RETRY_DELAY_SECONDS=3
+      - TZ=Asia/Shanghai
+    depends_on:
+      srs:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  # -----------------------------------------------------------
+  # Vue 3 前端（Nginx 静态托管）
+  # -----------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: susuper-frontend
+    restart: unless-stopped
+    ports:
+      - "3080:80"     # 3080 避开 Unraid WebUI 占用的 80
+    depends_on:
+      backend:
+        condition: service_started
+
+volumes:
+  srs_dvr:
+
+networks:
+  default:
+    name: susuper-net

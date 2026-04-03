@@ -1,0 +1,60 @@
+package handler
+
+import (
+	"net/http"
+
+	"github.com/gin-gonic/gin"
+	"susuper/internal/model"
+)
+
+// directPush POST /cities/:cityId/ffmpeg/direct-push
+// Body: { "streamSourceId": 123 }
+//
+// 无需排期，直接将指定直播源推流到视频号。
+// 停止旧进程 → 立即以该直播源启动新进程。
+func (h *Handler) directPush(c *gin.Context) {
+	cityID, err := cityIDFromParam(c)
+	if err != nil {
+		fail(c, http.StatusBadRequest, "invalid city id")
+		return
+	}
+	if !assertCityAccess(c, cityID) {
+		return
+	}
+
+	var req struct {
+		StreamSourceID int64 `json:"streamSourceId"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.StreamSourceID == 0 {
+		fail(c, http.StatusBadRequest, "streamSourceId required")
+		return
+	}
+
+	// 加载直播源
+	var sourceURL, sourceName string
+	if err := h.db.QueryRow(
+		`SELECT url, name FROM stream_sources WHERE id=? AND is_active=1`, req.StreamSourceID,
+	).Scan(&sourceURL, &sourceName); err != nil {
+		fail(c, http.StatusNotFound, "stream source not found or inactive")
+		return
+	}
+
+	// 停止可能存在的旧进程
+	h.ffmpeg.StopCity(cityID)
+
+	// 构造合成 ScheduleItem（无排期 ID）
+	item := &model.ScheduleItem{
+		ItemType:     "live_stream",
+		StreamSource: &model.StreamSource{URL: sourceURL},
+	}
+
+	if err := h.ffmpeg.StartCity(cityID, 0, item); err != nil {
+		fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	// 将直播源名称写入 DB，供 getCityStatus 的 currentItemName 展示
+	h.db.Exec(`UPDATE ffmpeg_processes SET direct_source_name=? WHERE city_id=?`, sourceName, cityID)
+
+	ok(c, gin.H{"started": true, "sourceName": sourceName})
+}

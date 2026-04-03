@@ -1,0 +1,19 @@
+# 环境变量（含密钥，不入库）
+.env
+
+# 运行时数据目录
+data/
+
+# Go 编译产物
+backend/susuper
+
+# Node 依赖和构建产物
+frontend/node_modules/
+frontend/dist/
+
+# macOS
+.DS_Store
+
+# 根目录散落文件（误操作产物）
+Dashboard.vue
+handler.go

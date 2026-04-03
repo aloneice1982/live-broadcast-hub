@@ -1,0 +1,49 @@
+susuper/
+├── docker-compose.yml          # 一键启动三个容器
+├── .env.example                # 环境变量模板（复制为 .env 填写真实值）
+│
+├── srs/
+│   └── conf/
+│       └── srs.conf            # SRS 配置（RTMP + HTTP API + 回调）
+│
+├── backend/                    # Go 后端（Phase 2）
+│   ├── Dockerfile
+│   ├── go.mod
+│   ├── main.go
+│   ├── db/
+│   │   └── schema.sql          # ★ 数据库表结构（Phase 1）
+│   ├── internal/
+│   │   ├── config/             # 环境变量读取
+│   │   ├── db/                 # SQLite 连接 + 迁移
+│   │   ├── handler/            # HTTP 路由处理器
+│   │   ├── service/
+│   │   │   ├── transcode.go    # 宣传片离线转码 Service（Phase 2）
+│   │   │   ├── scheduler.go    # 时间轴调度引擎（Phase 2）
+│   │   │   ├── ffmpeg.go       # FFmpeg 进程守护（Phase 2）
+│   │   │   └── sms.go          # 短信告警 Service（Phase 2）
+│   │   └── model/              # 数据库实体定义
+│   └── pkg/
+│       └── ffscript/           # FFmpeg 脚本生成工具（Phase 4）
+│
+├── frontend/                   # Vue 3 前端（Phase 3）
+│   ├── Dockerfile
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── src/
+│       ├── main.ts
+│       ├── App.vue
+│       ├── views/
+│       │   ├── Dashboard.vue   # 超管全省大盘
+│       │   ├── CityConsole.vue # 地市管理员一页式操作台
+│       │   └── Login.vue
+│       ├── components/
+│       │   ├── Timeline.vue    # 时间轴排期组件
+│       │   ├── StreamStatus.vue # 推流状态可视化
+│       │   └── VideoUpload.vue # 宣传片上传组件
+│       └── api/
+│           └── index.ts        # API 请求封装
+│
+└── data/                       # 运行时数据（Docker 挂载）
+    ├── db/                     # SQLite 文件
+    ├── uploads/                # 原始上传的宣传片
+    └── transcoded/             # 标准化转码后的宣传片
