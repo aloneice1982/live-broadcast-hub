@@ -57,10 +57,14 @@ func RequireSuperAdmin() gin.HandlerFunc {
 	}
 }
 
-// CityScope 确保 city_admin 只能操作自己的地市
+// CityScope 确保 city_admin 只能操作自己的地市；observer 禁止访问所有地市路由
 func CityScope() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		role, _ := c.Get("role")
+		if role == "observer" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "observers have read-only dashboard access"})
+			return
+		}
 		if role == "super_admin" {
 			c.Next()
 			return

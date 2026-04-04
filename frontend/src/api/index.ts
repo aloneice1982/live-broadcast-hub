@@ -3,11 +3,17 @@ import router from '@/router'
 
 export const api = axios.create({ baseURL: '/api' })
 
-// 401 自动跳登录页
+// 401 自动跳登录页（清除本地状态 + 提示用户）
+// 注意：跳过登录接口本身，避免密码错误时误弹"登录已失效"
 api.interceptors.response.use(
   res => res,
   err => {
-    if (err.response?.status === 401) router.push('/login')
+    if (err.response?.status === 401 && !err.config?.url?.includes('/auth/login')) {
+      localStorage.removeItem('token')
+      localStorage.removeItem('user')
+      alert('登录已失效，请重新登录')
+      router.push('/login')
+    }
     return Promise.reject(err)
   }
 )
@@ -26,7 +32,9 @@ export const citiesAPI = {
   directPush: (cityId: number, streamSourceId: number) =>
     api.post<{ data: { started: boolean; sourceName: string } }>(
       `/cities/${cityId}/ffmpeg/direct-push`, { streamSourceId }
-    )
+    ),
+  setMute: (cityId: number, muted: boolean) =>
+    api.post(`/cities/${cityId}/ffmpeg/mute`, { muted }),
 }
 
 // ── Stream Sources ────────────────────────────────────────────
@@ -49,7 +57,10 @@ export const streamSourcesAPI = {
 // ── Users ─────────────────────────────────────────────────────
 export const usersAPI = {
   list: () => api.get<{ data: User[] }>('/users'),
-  create: (data: any) => api.post('/users', data)
+  create: (data: any) => api.post('/users', data),
+  remove: (userId: number) => api.delete(`/users/${userId}`),
+  changePassword: (userId: number, password: string) =>
+    api.put(`/users/${userId}/password`, { password }),
 }
 
 // ── Videos ───────────────────────────────────────────────────
@@ -126,6 +137,7 @@ export interface PromoVideo {
 export interface StreamConfig {
   id: number; cityId: number; pushUrl?: string; pushKey?: string
   volumeGain: number; srsApp: string; srsStream: string
+  configLocked: boolean
 }
 
 export interface Schedule {
@@ -162,7 +174,7 @@ export interface ProcessStatus {
 }
 
 export interface User {
-  id: number; username: string; role: string; cityId?: number; phone?: string
+  id: number; username: string; role: 'super_admin' | 'city_admin' | 'observer'; cityId?: number; phone?: string
 }
 
 export interface AlertLog {

@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"golang.org/x/crypto/bcrypt"
@@ -33,8 +34,28 @@ func main() {
 		log.Fatalf("init admin password: %v", err)
 	}
 
-	// 3a. 迁移：补充 direct_source_name 列（已存在时忽略报错）
+	// 3a. 迁移：补充各列（已存在时忽略报错）
 	database.Exec(`ALTER TABLE ffmpeg_processes ADD COLUMN direct_source_name TEXT`)
+	database.Exec(`ALTER TABLE stream_configs ADD COLUMN config_locked INTEGER NOT NULL DEFAULT 0`)
+
+	// 3b. 迁移：users 表支持 observer 角色（重建 CHECK 约束）
+	var usersSchema string
+	database.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='users'`).Scan(&usersSchema)
+	if !strings.Contains(usersSchema, "'observer'") {
+		database.Exec(`ALTER TABLE users RENAME TO users_pre_observer`)
+		database.Exec(`CREATE TABLE users (
+			id            INTEGER PRIMARY KEY AUTOINCREMENT,
+			username      TEXT    NOT NULL UNIQUE,
+			password_hash TEXT    NOT NULL,
+			role          TEXT    NOT NULL CHECK (role IN ('super_admin','city_admin','observer')),
+			city_id       INTEGER REFERENCES cities(id) ON DELETE SET NULL,
+			phone         TEXT,
+			created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`)
+		database.Exec(`INSERT INTO users SELECT * FROM users_pre_observer`)
+		database.Exec(`DROP TABLE users_pre_observer`)
+		log.Printf("INFO: migrated users table to support observer role")
+	}
 
 	// 3b. 初始化固定频道（幂等）
 	if err := initFixedChannels(database, cfg.AdminInitialPassword); err != nil {
@@ -63,6 +84,9 @@ func main() {
 	ffmpegSvc := service.NewFFmpegService(database, cfg, smsSvc)
 	transcodeSvc := service.NewTranscodeService(database, cfg)
 	schedulerSvc := service.NewSchedulerService(database, ffmpegSvc)
+
+	// 4a. 每日 05:00 自动清空推流密钥（强制管理员每天重新填报）
+	service.StartDailyKeyReset(database, log.Default())
 
 	// 5. 创建 HTTP 路由
 	if cfg.AppEnv == "production" {

@@ -12,6 +12,7 @@ import { useAuthStore } from '@/stores/auth'
 
 const router = useRouter()
 const auth = useAuthStore()
+const isObserver = computed(() => auth.user?.role === 'observer')
 const activeTab = ref<'overview' | 'sources' | 'users'>('overview')
 
 // ── 地市状态 ──────────────────────────────────────────────────
@@ -226,6 +227,42 @@ async function createUser() {
   } finally { savingUser.value = false }
 }
 
+const editingPasswordUserId = ref<number | null>(null)
+const editingPassword = ref('')
+const changingPassword = ref(false)
+const pwError = ref('')
+const showPassword = ref(false)
+const pwSuccess = ref(false)
+
+async function deleteUser(userId: number) {
+  if (!confirm('确认删除该账号？此操作不可撤销')) return
+  try {
+    await usersAPI.remove(userId)
+    await loadUsers()
+  } catch (e: any) {
+    userError.value = e.response?.data?.error ?? '删除失败'
+  }
+}
+
+async function savePassword(userId: number) {
+  pwError.value = ''
+  pwSuccess.value = false
+  if (editingPassword.value.length < 8) { pwError.value = '密码不能少于 8 位'; return }
+  changingPassword.value = true
+  try {
+    await usersAPI.changePassword(userId, editingPassword.value)
+    pwSuccess.value = true
+    setTimeout(() => {
+      editingPasswordUserId.value = null
+      editingPassword.value = ''
+      showPassword.value = false
+      pwSuccess.value = false
+    }, 1500)
+  } catch (e: any) {
+    pwError.value = e.response?.data?.error ?? '修改失败'
+  } finally { changingPassword.value = false }
+}
+
 function logout() { auth.logout(); router.push('/login') }
 
 onMounted(() => {
@@ -249,7 +286,7 @@ onUnmounted(() => {
         <div class="flex items-center gap-3">
           <span class="text-xl">📡</span>
           <h1 class="font-bold text-white">苏超联赛直播分发中台</h1>
-          <span class="badge bg-blue-900/50 text-blue-300">超管大盘</span>
+          <span class="badge bg-blue-900/50 text-blue-300">{{ isObserver ? '观察员大盘' : '超管大盘' }}</span>
         </div>
         <button class="btn-ghost text-sm" @click="logout">退出登录</button>
       </div>
@@ -259,7 +296,7 @@ onUnmounted(() => {
       <!-- 选项卡（隐藏"排期管理"） -->
       <div class="flex gap-1 mb-6 bg-gray-900 border border-gray-800 rounded-xl p-1 w-fit">
         <button
-          v-for="tab in [{ key: 'overview', label: '全省大盘' }, { key: 'sources', label: '直播源管理' }, { key: 'users', label: '用户管理' }]"
+          v-for="tab in (isObserver ? [{ key: 'overview', label: '全省大盘' }] : [{ key: 'overview', label: '全省大盘' }, { key: 'sources', label: '直播源管理' }, { key: 'users', label: '用户管理' }])"
           :key="tab.key"
           class="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
           :class="activeTab === tab.key ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-gray-200'"
@@ -310,9 +347,9 @@ onUnmounted(() => {
           <div
             v-for="city in cities"
             :key="city.id"
-            class="card cursor-pointer border transition-all hover:scale-[1.02] h-28 flex flex-col justify-between overflow-hidden"
-            :class="statusBorder[displayStatus(city.id)]"
-            @click="router.push(`/city/${city.id}`)"
+            class="card border transition-all h-28 flex flex-col justify-between overflow-hidden"
+            :class="[statusBorder[displayStatus(city.id)], isObserver ? 'cursor-default' : 'cursor-pointer hover:scale-[1.02]']"
+            @click="!isObserver && router.push(`/city/${city.id}`)"
           >
             <!-- 顶部：城市名 + code -->
             <div class="flex items-center justify-between">
@@ -357,7 +394,7 @@ onUnmounted(() => {
                   今日 {{ statuses[city.id].todayItemCount }} 段排期
                 </p>
                 <button
-                  v-if="statuses[city.id]?.status === 'breaker_open'"
+                  v-if="statuses[city.id]?.status === 'breaker_open' && !isObserver"
                   class="mt-1.5 w-full text-xs px-2 py-1 rounded border border-red-600 text-red-400 hover:bg-red-900/30 transition-colors"
                   @click.stop="resetCityFFmpeg(city.id, $event)"
                 >清除熔断</button>
@@ -485,6 +522,7 @@ onUnmounted(() => {
               <select v-model="newUser.role" class="input">
                 <option value="city_admin">地市管理员</option>
                 <option value="super_admin">超级管理员</option>
+                <option value="observer">观察员（只读大盘）</option>
               </select>
             </div>
             <div v-if="newUser.role === 'city_admin'">
@@ -508,19 +546,69 @@ onUnmounted(() => {
                 <th class="px-4 py-2.5 text-left">角色</th>
                 <th class="px-4 py-2.5 text-left">城市</th>
                 <th class="px-4 py-2.5 text-left">手机</th>
+                <th class="px-4 py-2.5 text-right">操作</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-gray-800">
-              <tr v-for="u in users" :key="u.id" class="hover:bg-gray-800/50 transition-colors">
-                <td class="px-4 py-2.5 font-medium text-white">{{ u.username }}</td>
-                <td class="px-4 py-2.5">
-                  <span :class="u.role === 'super_admin' ? 'badge bg-blue-900/50 text-blue-300' : 'badge bg-gray-700 text-gray-300'">
-                    {{ u.role === 'super_admin' ? '超管' : '地市' }}
-                  </span>
-                </td>
-                <td class="px-4 py-2.5 text-gray-400">{{ cities.find(c => c.id === u.cityId)?.name ?? '—' }}</td>
-                <td class="px-4 py-2.5 text-gray-400 font-mono text-xs">{{ u.phone ?? '—' }}</td>
-              </tr>
+              <template v-for="u in users" :key="u.id">
+                <tr class="hover:bg-gray-800/50 transition-colors">
+                  <td class="px-4 py-2.5 font-medium text-white">{{ u.username }}</td>
+                  <td class="px-4 py-2.5">
+                    <span :class="u.role === 'super_admin' ? 'badge bg-blue-900/50 text-blue-300' : u.role === 'observer' ? 'badge bg-purple-900/50 text-purple-300' : 'badge bg-gray-700 text-gray-300'">
+                      {{ u.role === 'super_admin' ? '超管' : u.role === 'observer' ? '观察员' : '地市' }}
+                    </span>
+                  </td>
+                  <td class="px-4 py-2.5 text-gray-400">{{ cities.find(c => c.id === u.cityId)?.name ?? '—' }}</td>
+                  <td class="px-4 py-2.5 text-gray-400 font-mono text-xs">{{ u.phone ?? '—' }}</td>
+                  <td class="px-4 py-2.5 text-right">
+                    <div class="flex items-center justify-end gap-2">
+                      <button
+                        class="text-xs text-blue-400 hover:text-blue-300 transition-colors"
+                        @click="editingPasswordUserId = editingPasswordUserId === u.id ? null : u.id; editingPassword = ''; showPassword = false; pwError = ''"
+                      >修改密码</button>
+                      <span class="text-gray-700">|</span>
+                      <button
+                        class="text-xs text-red-400 hover:text-red-300 transition-colors disabled:opacity-30"
+                        :disabled="u.id === auth.user?.id"
+                        :title="u.id === auth.user?.id ? '不能删除自己' : '删除'"
+                        @click="deleteUser(u.id)"
+                      >删除</button>
+                    </div>
+                  </td>
+                </tr>
+                <tr v-if="editingPasswordUserId === u.id" class="bg-gray-800/40">
+                  <td colspan="5" class="px-4 py-3">
+                    <div class="flex items-center gap-3 flex-wrap">
+                      <span class="text-xs text-gray-400 shrink-0">新密码</span>
+                      <input
+                        v-model="editingPassword"
+                        :type="showPassword ? 'text' : 'password'"
+                        autocomplete="new-password"
+                        class="input py-1 text-sm flex-1 max-w-xs"
+                        placeholder="≥ 8 位"
+                        @keyup.enter="savePassword(u.id)"
+                      />
+                      <button
+                        type="button"
+                        class="text-xs text-gray-500 hover:text-gray-300 px-1 shrink-0"
+                        @click="showPassword = !showPassword"
+                        tabindex="-1"
+                      >{{ showPassword ? '隐藏' : '显示' }}</button>
+                      <button
+                        class="btn-primary py-1 px-3 text-xs shrink-0"
+                        :disabled="changingPassword"
+                        @click="savePassword(u.id)"
+                      >{{ changingPassword ? '保存中…' : '保存' }}</button>
+                      <button
+                        class="text-xs text-gray-500 hover:text-gray-300 shrink-0"
+                        @click="editingPasswordUserId = null; editingPassword = ''; showPassword = false; pwError = ''"
+                      >取消</button>
+                      <span v-if="pwSuccess" class="text-xs text-green-400 shrink-0">✓ 密码已修改</span>
+                      <span v-if="pwError" class="text-xs text-red-400 shrink-0">{{ pwError }}</span>
+                    </div>
+                  </td>
+                </tr>
+              </template>
             </tbody>
           </table>
         </div>

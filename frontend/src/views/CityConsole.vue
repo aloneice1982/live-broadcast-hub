@@ -21,6 +21,9 @@ const streamConfig = ref<StreamConfig | null>(null)
 const alerts = ref<AlertLog[]>([])
 const pageLoading = ref(true)
 
+// ── 默认推流地址 ──────────────────────────────────────────────
+const DEFAULT_PUSH_URL = 'rtmp://111583.livepush.myqcloud.com/trtc_1400439699/'
+
 // ── 日期工具（UTC+8 安全）────────────────────────────────────
 function localDateString(d = new Date()): string {
   const y = d.getFullYear()
@@ -89,14 +92,30 @@ const configForm = ref({ pushUrl: '', pushKey: '', volumeGain: 1.5 })
 const savingConfig = ref(false)
 const configMsg = ref('')
 const configExpanded = ref(true)  // 默认展开，方便首次配置
+const configEditing = ref(false)  // 本地编辑模式（仅展开表单，不改 DB 锁定状态）
+const configLocked = computed(() => streamConfig.value?.configLocked ?? false)
 
 watch(streamConfig, cfg => {
   if (cfg) {
-    configForm.value.pushUrl = cfg.pushUrl ?? ''
+    configForm.value.pushUrl = cfg.pushUrl || DEFAULT_PUSH_URL
     configForm.value.pushKey = cfg.pushKey ?? ''
     configForm.value.volumeGain = cfg.volumeGain ?? 1.5
   }
 })
+
+// ── 静音状态 ──────────────────────────────────────────────────
+const isMuted = ref(false)
+const mutingSwitching = ref(false)
+
+async function toggleMute() {
+  mutingSwitching.value = true
+  try {
+    await citiesAPI.setMute(cityId.value, !isMuted.value)
+    isMuted.value = !isMuted.value
+  } catch (e: any) {
+    pushError.value = e.response?.data?.error ?? '静音切换失败'
+  } finally { mutingSwitching.value = false }
+}
 
 // ── 加载 ──────────────────────────────────────────────────────
 async function loadAll() {
@@ -142,7 +161,7 @@ async function startDirectPush() {
     pushError.value = '请选择直播源'
     return
   }
-  if (!streamConfig.value?.pushUrl) {
+  if (!configForm.value.pushUrl) {
     pushError.value = '请先填写并保存推流地址'
     configExpanded.value = true
     return
@@ -168,6 +187,7 @@ async function startDirectPush() {
 async function stopPush() {
   await citiesAPI.resetFFmpeg(cityId.value)
   currentSourceName.value = ''
+  isMuted.value = false
   await fetchStatus()
   await loadAlerts()
 }
@@ -175,6 +195,7 @@ async function stopPush() {
 async function clearAlertsAndStatus() {
   if (!confirm('清除所有告警并重置推流状态？')) return
   await alertsAPI.clear(cityId.value)
+  isMuted.value = false
   await Promise.all([fetchStatus(), loadAlerts()])
 }
 
@@ -184,13 +205,14 @@ async function saveConfig() {
   configMsg.value = ''
   try {
     await streamConfigAPI.update(cityId.value, {
-      pushUrl: configForm.value.pushUrl,
+      pushUrl: configForm.value.pushUrl || DEFAULT_PUSH_URL,
       pushKey: configForm.value.pushKey,
       volumeGain: configForm.value.volumeGain
     })
     const res = await streamConfigAPI.get(cityId.value)
     streamConfig.value = res.data.data
-    configMsg.value = '✓ 已保存'
+    configEditing.value = false
+    configMsg.value = '✓ 已保存并锁定'
     setTimeout(() => { configMsg.value = '' }, 3000)
   } catch (e: any) {
     configMsg.value = '失败：' + (e.response?.data?.error ?? e.message)
@@ -272,37 +294,49 @@ const statusLabel: Record<string, string> = {
           </button>
 
           <template v-if="configExpanded">
-            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-              <div class="sm:col-span-2">
-                <label class="label">微信视频号推流地址</label>
-                <input v-model="configForm.pushUrl" class="input" placeholder="rtmp://push.weixin.qq.com/..." />
-              </div>
-              <div class="sm:col-span-2">
-                <label class="label">推流密钥</label>
-                <input v-model="configForm.pushKey" type="text" class="input font-mono text-sm" placeholder="请输入推流密钥" />
-              </div>
-              <div>
-                <label class="label">
-                  音量增益：<span class="text-blue-400 font-mono">{{ configForm.volumeGain.toFixed(1) }}x</span>
-                </label>
-                <input v-model.number="configForm.volumeGain" type="range" min="1.0" max="2.0" step="0.1" class="w-full accent-blue-500 mt-1" />
-                <p class="text-xs text-gray-500 mt-1">注：直播过程中调整音量将在下次推流时生效</p>
-              </div>
-              <div class="bg-gray-800/60 rounded-lg px-3 py-2.5">
-                <p class="text-xs font-medium text-gray-400 mb-1">SRS 内网挂载点（只读）</p>
-                <p class="text-xs font-mono text-gray-300">
-                  rtmp://srs:1935/{{ streamConfig?.srsApp ?? 'live' }}/{{ streamConfig?.srsStream ?? '—' }}
-                </p>
-              </div>
+            <!-- 已锁定且不在编辑模式：折叠显示 -->
+            <div v-if="configLocked && !configEditing"
+                 class="flex items-center justify-between px-4 py-2.5 rounded-lg bg-green-900/20 border border-green-700/50">
+              <span class="text-sm text-green-400 font-medium">🔒 推流密钥已就绪</span>
+              <button class="text-xs text-gray-400 hover:text-gray-200 transition-colors"
+                      @click="configEditing = true">修改</button>
             </div>
-            <div class="flex items-center gap-3">
-              <button class="btn-primary" :disabled="savingConfig" @click="saveConfig">
-                {{ savingConfig ? '保存中…' : '保存配置' }}
-              </button>
-              <span v-if="configMsg" class="text-xs" :class="configMsg.startsWith('✓') ? 'text-green-400' : 'text-red-400'">
-                {{ configMsg }}
-              </span>
-            </div>
+
+            <!-- 未锁定或正在编辑：显示完整表单 -->
+            <template v-else>
+              <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+                <div class="sm:col-span-2">
+                  <label class="label">微信视频号推流地址</label>
+                  <input v-model="configForm.pushUrl" class="input" :placeholder="DEFAULT_PUSH_URL" />
+                </div>
+                <div class="sm:col-span-2">
+                  <label class="label">推流密钥</label>
+                  <input v-model="configForm.pushKey" type="text" class="input font-mono text-sm" placeholder="请输入推流密钥" />
+                </div>
+                <div>
+                  <label class="label">
+                    音量增益：<span class="text-blue-400 font-mono">{{ configForm.volumeGain.toFixed(1) }}x</span>
+                  </label>
+                  <input v-model.number="configForm.volumeGain" type="range" min="1.0" max="2.0" step="0.1" class="w-full accent-blue-500 mt-1" />
+                  <p class="text-xs text-gray-500 mt-1">注：直播过程中调整音量将在下次推流时生效</p>
+                </div>
+                <div class="bg-gray-800/60 rounded-lg px-3 py-2.5">
+                  <p class="text-xs font-medium text-gray-400 mb-1">SRS 内网挂载点（只读）</p>
+                  <p class="text-xs font-mono text-gray-300">
+                    rtmp://srs:1935/{{ streamConfig?.srsApp ?? 'live' }}/{{ streamConfig?.srsStream ?? '—' }}
+                  </p>
+                </div>
+              </div>
+              <div class="flex items-center gap-3">
+                <button class="btn-primary" :disabled="!configForm.pushKey || savingConfig" @click="saveConfig">
+                  {{ savingConfig ? '保存中…' : '保存' }}
+                </button>
+                <span v-if="!configForm.pushKey && !savingConfig" class="text-xs text-yellow-400">填写密钥后保存即锁定</span>
+                <span v-if="configMsg" class="text-xs" :class="configMsg.startsWith('✓') ? 'text-green-400' : 'text-red-400'">
+                  {{ configMsg }}
+                </span>
+              </div>
+            </template>
           </template>
         </div>
 
@@ -338,15 +372,15 @@ const statusLabel: Record<string, string> = {
           </div>
 
           <!-- 推流配置未完成提示 -->
-          <div v-if="!streamConfig?.pushUrl"
+          <div v-if="!configLocked"
                class="rounded-lg bg-yellow-900/30 border border-yellow-800 px-4 py-2.5 text-sm text-yellow-300 flex gap-2 items-center">
             <span>⚠</span>
-            <span>推流地址未配置，
-              <button class="underline" @click="configExpanded = true">请展开上方配置 →</button>
+            <span>推流配置未锁定，
+              <button class="underline" @click="configExpanded = true; configEditing = true">请填写并保存推流密钥 →</button>
             </span>
           </div>
 
-          <!-- 推流中：状态面板 + 停止 -->
+          <!-- 推流中：状态面板 + 静音 + 停止 -->
           <template v-if="isStreaming">
             <div class="rounded-lg bg-gray-800/80 border border-gray-700/60 px-4 py-3">
               <div class="flex items-center justify-between gap-2">
@@ -362,6 +396,23 @@ const statusLabel: Record<string, string> = {
                 </span>
               </div>
             </div>
+
+            <!-- 静音切换 -->
+            <div class="flex flex-col gap-1">
+              <div class="flex items-center justify-between px-1">
+                <span class="text-xs text-gray-400">音量</span>
+                <button
+                  class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors"
+                  :class="isMuted
+                    ? 'border-yellow-600 text-yellow-300 bg-yellow-900/20'
+                    : 'border-gray-600 text-gray-300 hover:bg-gray-700/50'"
+                  :disabled="mutingSwitching"
+                  @click="toggleMute"
+                >{{ isMuted ? '🔇 恢复' : '🔊 静音' }}</button>
+              </div>
+              <p class="text-xs text-gray-600 px-1 text-right">切换静音可能导致画面短暂卡顿 1-2 秒</p>
+            </div>
+
             <button
               class="w-full px-4 py-3 rounded-lg border border-red-700/60 text-red-400 hover:bg-red-900/30 transition-colors text-sm font-semibold"
               @click="stopPush"
@@ -402,15 +453,16 @@ const statusLabel: Record<string, string> = {
 
             <button
               class="btn-primary w-full py-3 text-base font-semibold disabled:opacity-40"
-              :disabled="!selectedSourceId || !streamConfig?.pushUrl || pushing"
+              :disabled="!selectedSourceId || !configLocked || pushing"
               @click="startDirectPush"
             >
               {{ pushing ? '启动中…' : '⚡ 开始推流' }}
             </button>
 
-            <p v-if="!streamConfig?.pushUrl" class="text-xs text-center text-yellow-400">
-              请先完善并保存推流配置
+            <p v-if="!configLocked" class="text-xs text-center text-yellow-400">
+              请先保存推流密钥后才能开播
             </p>
+
           </template>
 
         </div>

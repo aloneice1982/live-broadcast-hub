@@ -53,13 +53,14 @@ type PromotionalVideo struct {
 
 // ── StreamConfig ──────────────────────────────────────────────
 type StreamConfig struct {
-	ID         int64   `json:"id"`
-	CityID     int64   `json:"cityId"`
-	PushURL    *string `json:"pushUrl"`
-	PushKey    *string `json:"pushKey,omitempty"` // 脱敏，不直接返回
-	VolumeGain float64 `json:"volumeGain"`
-	SRSApp     string  `json:"srsApp"`
-	SRSStream  string  `json:"srsStream"`
+	ID           int64   `json:"id"`
+	CityID       int64   `json:"cityId"`
+	PushURL      *string `json:"pushUrl"`
+	PushKey      *string `json:"pushKey,omitempty"` // 脱敏，不直接返回
+	VolumeGain   float64 `json:"volumeGain"`
+	SRSApp       string  `json:"srsApp"`
+	SRSStream    string  `json:"srsStream"`
+	ConfigLocked bool    `json:"configLocked"` // true = 密钥已保存并锁定，可以开播
 }
 
 // ── Schedule ──────────────────────────────────────────────────

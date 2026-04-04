@@ -47,6 +47,7 @@ type managedProc struct {
 	procType  string
 	done      chan struct{} // 关闭时通知 watchdog
 	stderrBuf *stderrRing  // 捕获 stderr 末尾行，用于错误诊断
+	discarded bool         // true = 已被 SetMute/SwitchSource 主动替换，watchdog 不应重启
 }
 
 // stderrRing 保留 ffmpeg stderr 最后 N 行，用于故障诊断
@@ -113,14 +114,16 @@ func classifyFFmpegErr(exitErr error, lastLine string) string {
 
 // citySession 代表某个地市的完整推流会话
 type citySession struct {
-	cityID     int64
-	scheduleID int64
-	inject     *managedProc
-	push       *managedProc
-	retries    int
-	mu         sync.Mutex
-	ctx        context.Context
-	cancel     context.CancelFunc
+	cityID           int64
+	scheduleID       int64
+	inject           *managedProc
+	push             *managedProc
+	retries          int
+	mu               sync.Mutex
+	ctx              context.Context
+	cancel           context.CancelFunc
+	currentSourceURL string // 当前 inject 进程使用的直播源 URL（静音切换时复用）
+	isMuted          bool
 }
 
 // FFmpegService 管理所有地市的推流进程
@@ -140,9 +143,9 @@ func NewFFmpegService(db *sql.DB, cfg *config.Config, sms *SMSService) *FFmpegSe
 		sessions: make(map[int64]*citySession),
 		db:       db,
 		cfg:      cfg,
-		sms:      sms,
-		srs:      srsapi.New(cfg.SRSHost, cfg.SRSAPIPort),
-		logger:   log.New(os.Stdout, "[ffmpeg] ", log.LstdFlags),
+		sms:             sms,
+		srs:             srsapi.New(cfg.SRSHost, cfg.SRSAPIPort),
+		logger:          log.New(os.Stdout, "[ffmpeg] ", log.LstdFlags),
 	}
 }
 
@@ -197,6 +200,10 @@ func (s *FFmpegService) StartCity(cityID, scheduleID int64, firstItem *model.Sch
 		s.stopCityLocked(cityID)
 		return fmt.Errorf("start inject proc: %w", err)
 	}
+	// 记录直播源 URL，供 SetMute 切换时复用
+	if firstItem.StreamSource != nil {
+		sess.currentSourceURL = firstItem.StreamSource.URL
+	}
 
 	_ = s.updateDBStatus(cityID, scheduleID, "streaming", firstItem.ID, 0)
 	s.logger.Printf("city=%d started (schedule=%d)", cityID, scheduleID)
@@ -229,6 +236,7 @@ func (s *FFmpegService) SwitchSource(cityID int64, item *model.ScheduleItem) err
 	// 无缝切流：先启动新进程 → SRS 确认 → 再停旧进程
 	// 详见 seamlessSwitch 函数注释
 	oldInject := sess.inject
+	oldInject.discarded = true // 通知 watchdog 不要重启旧进程
 	if err := s.seamlessSwitch(sess, newArgs, cfg.SRSApp, cfg.SRSStream); err != nil {
 		return fmt.Errorf("seamless switch: %w", err)
 	}
@@ -284,6 +292,48 @@ func (s *FFmpegService) HasSession(cityID int64) bool {
 	return ok
 }
 
+// SetMute 切换静音状态：以 gain=0（静音）或原始 gain 重启 inject 进程，push 进程不受影响
+func (s *FFmpegService) SetMute(cityID int64, muted bool) error {
+	s.mu.RLock()
+	sess, ok := s.sessions[cityID]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("city %d: no active session", cityID)
+	}
+
+	cfg, err := s.loadStreamConfig(cityID)
+	if err != nil {
+		return err
+	}
+	if sess.currentSourceURL == "" {
+		return fmt.Errorf("city %d: source URL not recorded (not a direct push?)", cityID)
+	}
+
+	// 临时覆盖 VolumeGain：静音时置 0，恢复时用 DB 原值
+	if muted {
+		cfg.VolumeGain = 0
+	}
+	item := &model.ScheduleItem{
+		ItemType:     "live_stream",
+		StreamSource: &model.StreamSource{URL: sess.currentSourceURL},
+	}
+	newArgs, err := s.buildInjectArgs(cfg, item)
+	if err != nil {
+		return err
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	old := sess.inject
+	old.discarded = true // 通知 watchdog 不要重启旧进程
+	if err := s.startProc(sess, procTypeInject, newArgs); err != nil {
+		return err
+	}
+	s.killProc(old)
+	sess.isMuted = muted
+	return nil
+}
+
 // ── 进程启动与守护 ──────────────────────────────────────────────
 
 // startProc 启动一个 FFmpeg 子进程并注册 watchdog goroutine
@@ -323,8 +373,8 @@ func (s *FFmpegService) watchdog(sess *citySession, mp *managedProc) {
 	err := mp.cmd.Wait()
 	close(mp.done)
 
-	// 如果 context 已取消（正常停止），不重启
-	if sess.ctx.Err() != nil {
+	// 如果 context 已取消（正常停止）或进程已被主动替换，不重启
+	if sess.ctx.Err() != nil || mp.discarded {
 		return
 	}
 

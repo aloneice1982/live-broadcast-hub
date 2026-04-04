@@ -11,7 +11,7 @@ import (
 // Body: { "streamSourceId": 123 }
 //
 // 无需排期，直接将指定直播源推流到视频号。
-// 停止旧进程 → 立即以该直播源启动新进程。
+// 停止旧进程 → 立��以该直播源启动新进程。
 func (h *Handler) directPush(c *gin.Context) {
 	cityID, err := cityIDFromParam(c)
 	if err != nil {
@@ -36,6 +36,14 @@ func (h *Handler) directPush(c *gin.Context) {
 		`SELECT url, name FROM stream_sources WHERE id=? AND is_active=1`, req.StreamSourceID,
 	).Scan(&sourceURL, &sourceName); err != nil {
 		fail(c, http.StatusNotFound, "stream source not found or inactive")
+		return
+	}
+
+	// 检查配置是否已锁定
+	var locked int
+	h.db.QueryRow(`SELECT config_locked FROM stream_configs WHERE city_id=?`, cityID).Scan(&locked)
+	if locked == 0 {
+		fail(c, http.StatusBadRequest, "推流配置未锁定，请先保存推流密钥")
 		return
 	}
 

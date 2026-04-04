@@ -5,7 +5,7 @@ import { api } from '@/api'
 interface User {
   id: number
   username: string
-  role: 'super_admin' | 'city_admin'
+  role: 'super_admin' | 'city_admin' | 'observer'
   cityId?: number
 }
 

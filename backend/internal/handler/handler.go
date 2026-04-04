@@ -61,12 +61,14 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	authed := api.Group("", middleware.Auth(h.cfg.JWTSecret))
 	authed.GET("/cities", h.listCities)
 	authed.GET("/cities/:cityId/status", h.getCityStatus)
+	authed.GET("/stream-sources", h.listStreamSources)
 
 	// 超管专属
 	superOnly := authed.Group("", middleware.RequireSuperAdmin())
 	superOnly.GET("/users", h.listUsers)
 	superOnly.POST("/users", h.createUser)
-	superOnly.GET("/stream-sources", h.listStreamSources)
+	superOnly.DELETE("/users/:userId", h.deleteUser)
+	superOnly.PUT("/users/:userId/password", h.changePassword)
 	superOnly.GET("/stream-sources/template", h.downloadSourceTemplate)
 	superOnly.POST("/stream-sources/import", h.importStreamSources)
 	superOnly.POST("/stream-sources", h.createStreamSource)
@@ -92,6 +94,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	cityRoutes.GET("/alerts", h.listAlerts)
 	cityRoutes.POST("/ffmpeg/reset", h.resetFFmpeg)
 	cityRoutes.POST("/ffmpeg/direct-push", h.directPush)
+	cityRoutes.POST("/ffmpeg/mute", h.setMute)
 	cityRoutes.POST("/alerts/clear", h.clearAlerts)
 }
 
@@ -323,7 +326,7 @@ func (h *Handler) getCityStatus(c *gin.Context) {
 		cityID, today,
 	).Scan(&result.TodayItemCount)
 
-	ok(c, result)
+		ok(c, result)
 }
 
 // ── Users (super admin) ─────────────────────────────────────────
@@ -350,7 +353,7 @@ func (h *Handler) listUsers(c *gin.Context) {
 type createUserReq struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required,min=8"`
-	Role     string `json:"role" binding:"required,oneof=super_admin city_admin"`
+	Role     string `json:"role" binding:"required,oneof=super_admin city_admin observer"`
 	CityID   *int64 `json:"cityId"`
 	Phone    string `json:"phone"`
 }
@@ -735,10 +738,10 @@ func (h *Handler) getStreamConfig(c *gin.Context) {
 
 	var sc model.StreamConfig
 	row := h.db.QueryRow(
-		`SELECT id, city_id, push_url, push_key, volume_gain, srs_app, srs_stream
+		`SELECT id, city_id, push_url, push_key, volume_gain, srs_app, srs_stream, config_locked
 		   FROM stream_configs WHERE city_id=?`, cityID)
 	if err := row.Scan(&sc.ID, &sc.CityID, &sc.PushURL, &sc.PushKey,
-		&sc.VolumeGain, &sc.SRSApp, &sc.SRSStream); err != nil {
+		&sc.VolumeGain, &sc.SRSApp, &sc.SRSStream, &sc.ConfigLocked); err != nil {
 		fail(c, http.StatusNotFound, "stream config not found")
 		return
 	}
@@ -778,6 +781,11 @@ func (h *Handler) updateStreamConfig(c *gin.Context) {
 	if req.PushKey != nil {
 		setParts = append(setParts, "push_key=?")
 		args = append(args, *req.PushKey)
+		if *req.PushKey == "" {
+			setParts = append(setParts, "config_locked=0")
+		} else {
+			setParts = append(setParts, "config_locked=1")
+		}
 	}
 	if req.VolumeGain != nil {
 		setParts = append(setParts, "volume_gain=?")

@@ -10,7 +10,8 @@ const router = createRouter({
     { path: '/', redirect: () => {
       const auth = useAuthStore()
       if (!auth.token) return '/login'
-      return auth.user?.role === 'super_admin' ? '/dashboard' : `/city/${auth.user?.cityId}`
+      if (auth.user?.role === 'city_admin') return `/city/${auth.user.cityId}`
+      return '/dashboard'  // super_admin + observer 都去大盘
     }}
   ]
 })
@@ -18,8 +19,13 @@ const router = createRouter({
 router.beforeEach((to) => {
   const auth = useAuthStore()
   if (!to.meta.public && !auth.token) return '/login'
-  if (to.meta.role && auth.user?.role !== to.meta.role) {
-    return auth.user?.role === 'super_admin' ? '/dashboard' : `/city/${auth.user?.cityId}`
+  if (to.meta.role === 'super_admin') {
+    if (auth.user?.role !== 'super_admin' && auth.user?.role !== 'observer') {
+      // 容错：city_admin 无 cityId 时回登录页，避免 /city/undefined 死循环
+      return (auth.user?.role === 'city_admin' && auth.user?.cityId)
+        ? `/city/${auth.user.cityId}`
+        : '/login'
+    }
   }
 })
 
