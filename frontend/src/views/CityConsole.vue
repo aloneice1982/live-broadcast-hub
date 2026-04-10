@@ -106,6 +106,7 @@ watch(streamConfig, cfg => {
 // ── 静音状态 ──────────────────────────────────────────────────
 const isMuted = ref(false)
 const mutingSwitching = ref(false)
+const showBandwidthModal = ref(false)
 
 async function toggleMute() {
   mutingSwitching.value = true
@@ -178,7 +179,12 @@ async function startDirectPush() {
       if (isStreaming.value) break
     }
   } catch (e: any) {
-    pushError.value = e.response?.data?.error ?? '启动失败'
+    if (e.response?.status === 503 &&
+        e.response?.data?.error === 'SERVER_BANDWIDTH_FULL') {
+      showBandwidthModal.value = true
+    } else {
+      pushError.value = e.response?.data?.error ?? '启动失败'
+    }
   } finally {
     pushing.value = false
   }
@@ -504,4 +510,21 @@ const statusLabel: Record<string, string> = {
       </template>
     </main>
   </div>
+
+  <!-- 带宽限制弹窗 -->
+  <Teleport to="body">
+    <div v-if="showBandwidthModal"
+         class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div class="bg-gray-900 border border-gray-700 rounded-2xl p-6 max-w-sm w-full mx-4 shadow-2xl">
+        <div class="flex items-start gap-3 mb-4">
+          <span class="text-2xl leading-none shrink-0">⚠️</span>
+          <div>
+            <h3 class="font-semibold text-white mb-1">服务器资源已满</h3>
+            <p class="text-sm text-gray-400">当前服务器带宽已达上限，请稍后再试。</p>
+          </div>
+        </div>
+        <button class="btn-primary w-full" @click="showBandwidthModal = false">知道了</button>
+      </div>
+    </div>
+  </Teleport>
 </template>
