@@ -95,6 +95,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	cityRoutes.POST("/ffmpeg/reset", h.resetFFmpeg)
 	cityRoutes.POST("/ffmpeg/direct-push", h.directPush)
 	cityRoutes.POST("/ffmpeg/mute", h.setMute)
+	cityRoutes.POST("/ffmpeg/insert-promo", h.insertPromo)
 	cityRoutes.POST("/alerts/clear", h.clearAlerts)
 }
 
@@ -246,6 +247,7 @@ func (h *Handler) getCityStatus(c *gin.Context) {
 		NextItemName     *string `json:"nextItemName,omitempty"`
 		NextItemTime     *string `json:"nextItemTime,omitempty"`
 		LastStartedAt    *string `json:"lastStartedAt,omitempty"`
+		PromoInserting   bool    `json:"promoInserting"`
 	}
 	result := enrichedStatus{FFmpegProcess: fp}
 	if lastStartedAt.Valid {
@@ -258,6 +260,8 @@ func (h *Handler) getCityStatus(c *gin.Context) {
 
 	// 调度器 goroutine 是否在运行（含等待 start_time 阶段）
 	result.SchedulerActive = h.scheduler.IsRunning(cityID)
+	// 是否正在插播宣传片
+	result.PromoInserting = h.ffmpeg.IsPromoInserting(cityID)
 
 	// 当前活动排期的状态
 	if fp.ScheduleID != nil {

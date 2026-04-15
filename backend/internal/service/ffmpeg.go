@@ -36,8 +36,9 @@ import (
 )
 
 const (
-	procTypeInject = "inject"
-	procTypePush   = "push"
+	procTypeInject      = "inject"
+	procTypePush        = "push"
+	procTypeInjectPromo = "inject-promo" // 宣传片单次插播进程
 )
 
 // managedProc 代表一个受守护的 FFmpeg 子进程
@@ -116,7 +117,8 @@ func classifyFFmpegErr(exitErr error, lastLine string) string {
 type citySession struct {
 	cityID           int64
 	scheduleID       int64
-	inject           *managedProc
+	inject           *managedProc // 主 inject 进程（直播流）
+	injectPromo      *managedProc // 宣传片插播进程（临时，播完自动退出）
 	push             *managedProc
 	retries          int
 	mu               sync.Mutex
@@ -264,6 +266,7 @@ func (s *FFmpegService) stopCityLocked(cityID int64) {
 	s.logger.Printf("city=%d stopping...", cityID)
 	sess.cancel()
 	s.killProc(sess.inject)
+	s.killProc(sess.injectPromo) // 停止宣传片插播进程（如果存在）
 	s.killProc(sess.push)
 	delete(s.sessions, cityID)
 	_ = s.updateDBStatus(cityID, 0, "idle", 0, 0)
@@ -290,6 +293,19 @@ func (s *FFmpegService) HasSession(cityID int64) bool {
 	defer s.mu.RUnlock()
 	_, ok := s.sessions[cityID]
 	return ok
+}
+
+// IsPromoInserting 返回该地市是否正在插播宣传片
+func (s *FFmpegService) IsPromoInserting(cityID int64) bool {
+	s.mu.RLock()
+	sess, ok := s.sessions[cityID]
+	s.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.injectPromo != nil
 }
 
 // SetMute 切换静音状态：以 gain=0（静音）或原始 gain 重启 inject 进程，push 进程不受影响
@@ -334,6 +350,75 @@ func (s *FFmpegService) SetMute(cityID int64, muted bool) error {
 	return nil
 }
 
+// StartPromoInsert 启动宣传片插播（播放一次后自动退出）
+// 插播期间 inject 进程继续拉流但不推（保持连接），push 进程从 SRS 拉取宣传片流
+func (s *FFmpegService) StartPromoInsert(cityID int64, promoVideoID int64) error {
+	s.mu.RLock()
+	sess, ok := s.sessions[cityID]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("city %d: no active session", cityID)
+	}
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	if sess.injectPromo != nil {
+		return fmt.Errorf("promo already playing")
+	}
+
+	// 1. 查询宣传片路径
+	var transcodedPath string
+	var cityCode string
+	err := s.db.QueryRow(
+		`SELECT pv.transcoded_path, c.code
+		   FROM promotional_videos pv
+		   JOIN cities c ON pv.city_id = c.id
+		  WHERE pv.id=? AND pv.city_id=? AND pv.transcode_status='done'`,
+		promoVideoID, cityID,
+	).Scan(&transcodedPath, &cityCode)
+	if err != nil {
+		return fmt.Errorf("promo video not found or not transcoded")
+	}
+
+	// 2. 构建 inject-promo 命令（播放 1 次）
+	srsURL := fmt.Sprintf("rtmp://%s:%s/live/%s", s.cfg.SRSHost, s.cfg.SRSRTMPPort, cityCode)
+	args := ffscript.InjectPromoOnceArgs(transcodedPath, srsURL)
+
+	// 3. 启动 inject-promo 进程
+	if err := s.startProc(sess, procTypeInjectPromo, args); err != nil {
+		return fmt.Errorf("start inject-promo: %w", err)
+	}
+
+	// 4. 启动专用 watchdog（播完自动退出，不重启）
+	go s.watchdogPromo(sess, sess.injectPromo)
+
+	s.logger.Printf("city=%d promo insert started (video_id=%d)", cityID, promoVideoID)
+	return nil
+}
+
+// watchdogPromo 监控宣传片插播进程（播完自动退出，不重启）
+func (s *FFmpegService) watchdogPromo(sess *citySession, mp *managedProc) {
+	err := mp.cmd.Wait()
+	close(mp.done)
+
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+
+	// 播完自动退出（exit code 0），清理进程，不重启
+	if mp.cmd.ProcessState != nil && mp.cmd.ProcessState.ExitCode() == 0 {
+		sess.injectPromo = nil
+		s.logger.Printf("city=%d promo insert finished normally", sess.cityID)
+		return
+	}
+
+	// 异常退出，记录告警但不重启
+	reason := classifyFFmpegErr(err, mp.stderrBuf.LastMeaningful())
+	_ = s.logAlert(sess.cityID, "warn", fmt.Sprintf("宣传片插播异常退出：%s", reason))
+	sess.injectPromo = nil
+	s.logger.Printf("city=%d promo insert failed: %v", sess.cityID, err)
+}
+
 // ── 进程启动与守护 ──────────────────────────────────────────────
 
 // startProc 启动一个 FFmpeg 子进程并注册 watchdog goroutine
@@ -360,10 +445,14 @@ func (s *FFmpegService) startProc(sess *citySession, procType string, args []str
 		sess.inject = mp
 	case procTypePush:
 		sess.push = mp
+	case procTypeInjectPromo:
+		sess.injectPromo = mp
 	}
 
-	// 启动守护 goroutine
-	go s.watchdog(sess, mp)
+	// 宣传片插播进程由 watchdogPromo 单独管理，不走标准 watchdog
+	if procType != procTypeInjectPromo {
+		go s.watchdog(sess, mp)
+	}
 	s.logger.Printf("city=%d [%s] started pid=%d", sess.cityID, procType, cmd.Process.Pid)
 	return nil
 }

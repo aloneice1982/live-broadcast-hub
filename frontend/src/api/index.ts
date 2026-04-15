@@ -35,6 +35,10 @@ export const citiesAPI = {
     ),
   setMute: (cityId: number, muted: boolean) =>
     api.post(`/cities/${cityId}/ffmpeg/mute`, { muted }),
+  insertPromo: (cityId: number, promoVideoId: number) =>
+    api.post<{ data: { inserting: boolean } }>(
+      `/cities/${cityId}/ffmpeg/insert-promo`, { promoVideoId }
+    ),
 }
 
 // ── Stream Sources ────────────────────────────────────────────
@@ -171,6 +175,7 @@ export interface ProcessStatus {
   nextItemName?: string
   nextItemTime?: string
   lastStartedAt?: string   // 东八区本地时间字符串 "YYYY-MM-DD HH:MM:SS"
+  promoInserting?: boolean // 是否正在插播宣传片
 }
 
 export interface User {

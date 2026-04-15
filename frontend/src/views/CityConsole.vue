@@ -5,8 +5,8 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
-  citiesAPI, streamSourcesAPI, streamConfigAPI, alertsAPI,
-  type City, type ProcessStatus, type StreamSource, type StreamConfig, type AlertLog
+  citiesAPI, streamSourcesAPI, streamConfigAPI, alertsAPI, videosAPI,
+  type City, type ProcessStatus, type StreamSource, type StreamConfig, type AlertLog, type PromoVideo
 } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 
@@ -108,6 +108,12 @@ const isMuted = ref(false)
 const mutingSwitching = ref(false)
 const showBandwidthModal = ref(false)
 
+// ── 宣传片插播 ────────────────────────────────────────────────
+const promoVideos = ref<PromoVideo[]>([])
+const selectedPromoId = ref<number | null>(null)
+const insertingPromo = ref(false)
+const promoError = ref('')
+
 async function toggleMute() {
   mutingSwitching.value = true
   try {
@@ -121,10 +127,11 @@ async function toggleMute() {
 // ── 加载 ──────────────────────────────────────────────────────
 async function loadAll() {
   pageLoading.value = true
-  const [citiesRes, sourcesRes, configRes] = await Promise.allSettled([
+  const [citiesRes, sourcesRes, configRes, videosRes] = await Promise.allSettled([
     citiesAPI.list(),
     streamSourcesAPI.list(),
     streamConfigAPI.get(cityId.value),
+    videosAPI.list(cityId.value),
   ])
 
   if (citiesRes.status === 'fulfilled')
@@ -133,6 +140,8 @@ async function loadAll() {
     streamSources.value = sourcesRes.value.data.data ?? []
   if (configRes.status === 'fulfilled')
     streamConfig.value = configRes.value.data.data
+  if (videosRes.status === 'fulfilled')
+    promoVideos.value = (videosRes.value.data.data ?? []).filter(v => v.transcodeStatus === 'done')
 
   await Promise.all([fetchStatus(), loadAlerts()])
   pageLoading.value = false
@@ -226,6 +235,20 @@ async function saveConfig() {
 }
 
 function logout() { auth.logout(); router.push('/login') }
+
+async function insertPromo() {
+  if (!selectedPromoId.value) return
+  insertingPromo.value = true
+  promoError.value = ''
+  try {
+    await citiesAPI.insertPromo(cityId.value, selectedPromoId.value)
+    selectedPromoId.value = null
+  } catch (e: any) {
+    promoError.value = e.response?.data?.error ?? '插播失败'
+  } finally {
+    insertingPromo.value = false
+  }
+}
 
 function formatAlertMsg(msg: string): string {
   return msg
@@ -423,6 +446,43 @@ const statusLabel: Record<string, string> = {
               class="w-full px-4 py-3 rounded-lg border border-red-700/60 text-red-400 hover:bg-red-900/30 transition-colors text-sm font-semibold"
               @click="stopPush"
             >⏹ 停止推流</button>
+
+            <!-- 宣传片插播 -->
+            <div class="border-t border-gray-700/50 pt-3 space-y-2">
+              <p class="text-xs font-medium text-gray-400">📺 插播宣传片</p>
+
+              <!-- 插播中状态 -->
+              <div v-if="currentStatus?.promoInserting"
+                   class="rounded-lg bg-purple-900/30 border border-purple-700/60 px-3 py-2.5 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-purple-400 animate-pulse shrink-0" />
+                <div>
+                  <span class="text-sm font-medium text-purple-300">宣传片播放中</span>
+                  <span class="text-xs text-purple-500 ml-2">播完后自动切回直播流</span>
+                </div>
+              </div>
+
+              <!-- 插播选择（非插播中时显示） -->
+              <template v-else>
+                <div v-if="promoVideos.length === 0" class="text-xs text-gray-500">
+                  暂无已转码宣传片，请在排期管理中上传
+                </div>
+                <template v-else>
+                  <select v-model="selectedPromoId" class="input text-sm">
+                    <option :value="null">— 选择宣传片 —</option>
+                    <option v-for="v in promoVideos" :key="v.id" :value="v.id">
+                      {{ v.displayName || v.originalFilename }}{{ v.durationSeconds ? ` (${v.durationSeconds}秒)` : '' }}
+                    </option>
+                  </select>
+                  <p v-if="promoError" class="text-xs text-red-400">⚠ {{ promoError }}</p>
+                  <button
+                    class="btn-primary w-full"
+                    :disabled="!selectedPromoId || insertingPromo"
+                    @click="insertPromo"
+                  >{{ insertingPromo ? '插播中…' : '⚡ 立即插播' }}</button>
+                  <p class="text-xs text-gray-600 text-center">播放完成后自动切回直播流</p>
+                </template>
+              </template>
+            </div>
           </template>
 
           <!-- 空闲：直播源选择 + 启动 -->

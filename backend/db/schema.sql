@@ -149,7 +149,9 @@ CREATE TABLE IF NOT EXISTS ffmpeg_processes (
     retry_count     INTEGER NOT NULL DEFAULT 0,
     last_started_at DATETIME,
     last_failed_at  DATETIME,
-    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP
+    updated_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+    promo_inserting INTEGER NOT NULL DEFAULT 0,  -- 0/1，是否正在插播宣传片
+    direct_source_name TEXT                      -- 直推模式下的直播源名称
 );
 
 -- 每个地市预置一条 idle 记录

@@ -207,6 +207,28 @@ func TranscodeArgs(inputPath, outputPath, resolution, fps, gop, audioBitrate, au
 	}
 }
 
+// InjectPromoOnceArgs 生成"宣传片单次播放注入 SRS"的 FFmpeg 参数
+//
+// 与 InjectPromoArgs 的区别：
+//   - 不循环，播放一次后 FFmpeg 自然退出（exit code 0）
+//   - watchdogPromo 检测到正常退出后自动切回直播流
+//
+// 关键参数说明：
+//   -stream_loop 0   不循环（0 = 播放原始文件 1 次后退出），
+//                    对比 -stream_loop -1（无限循环）
+func InjectPromoOnceArgs(transcodedPath, srsRTMPURL string) []string {
+	return []string{
+		"-re",
+		"-stream_loop", "0", // 播放 1 次后退出
+		"-fflags", "+genpts",
+		"-i", transcodedPath,
+		"-c", "copy",
+		"-flvflags", "no_duration_filesize",
+		"-f", "flv",
+		srsRTMPURL,
+	}
+}
+
 // SRSStreamURL 构造 SRS RTMP 挂载点 URL
 // 格式: rtmp://{host}:{port}/{app}/{stream}
 func SRSStreamURL(host, port, app, stream string) string {
