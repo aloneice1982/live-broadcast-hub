@@ -109,10 +109,19 @@ const mutingSwitching = ref(false)
 const showBandwidthModal = ref(false)
 
 // ── 宣传片插播 ────────────────────────────────────────────────
-const promoVideos = ref<PromoVideo[]>([])
+const promoVideos = ref<PromoVideo[]>([])       // 已转码，供插播选择
+const allPromoVideos = ref<PromoVideo[]>([])    // 全部，含转码中，供管理卡片
 const selectedPromoId = ref<number | null>(null)
 const insertingPromo = ref(false)
 const promoError = ref('')
+
+// ── 宣传片上传管理 ────────────────────────────────────────────
+const uploadFile = ref<File | null>(null)
+const uploading = ref(false)
+const uploadProgress = ref(0)
+const uploadError = ref('')
+const uploadAbort = ref<AbortController | null>(null)
+const videoMgmtExpanded = ref(false)
 
 async function toggleMute() {
   mutingSwitching.value = true
@@ -140,8 +149,10 @@ async function loadAll() {
     streamSources.value = sourcesRes.value.data.data ?? []
   if (configRes.status === 'fulfilled')
     streamConfig.value = configRes.value.data.data
-  if (videosRes.status === 'fulfilled')
-    promoVideos.value = (videosRes.value.data.data ?? []).filter(v => v.transcodeStatus === 'done')
+  if (videosRes.status === 'fulfilled') {
+    allPromoVideos.value = videosRes.value.data.data ?? []
+    promoVideos.value = allPromoVideos.value.filter(v => v.transcodeStatus === 'done')
+  }
 
   await Promise.all([fetchStatus(), loadAlerts()])
   pageLoading.value = false
@@ -248,6 +259,39 @@ async function insertPromo() {
   } finally {
     insertingPromo.value = false
   }
+}
+
+async function uploadPromoVideo() {
+  if (!uploadFile.value) return
+  uploading.value = true
+  uploadProgress.value = 0
+  uploadError.value = ''
+  const ctrl = new AbortController()
+  uploadAbort.value = ctrl
+  try {
+    await videosAPI.upload(cityId.value, uploadFile.value,
+      (pct) => { uploadProgress.value = pct },
+      ctrl.signal
+    )
+    uploadFile.value = null
+    const res = await videosAPI.list(cityId.value)
+    allPromoVideos.value = res.data.data ?? []
+    promoVideos.value = allPromoVideos.value.filter(v => v.transcodeStatus === 'done')
+  } catch (e: any) {
+    if ((e as any).code !== 'ERR_CANCELED')
+      uploadError.value = e.response?.data?.error ?? '上传失败'
+  } finally {
+    uploading.value = false
+    uploadAbort.value = null
+  }
+}
+
+async function deletePromoVideo(videoId: number) {
+  if (!confirm('确认删除此宣传片？')) return
+  await videosAPI.remove(cityId.value, videoId)
+  const res = await videosAPI.list(cityId.value)
+  allPromoVideos.value = res.data.data ?? []
+  promoVideos.value = allPromoVideos.value.filter(v => v.transcodeStatus === 'done')
 }
 
 function formatAlertMsg(msg: string): string {
@@ -531,6 +575,66 @@ const statusLabel: Record<string, string> = {
 
           </template>
 
+        </div>
+
+        <!-- ── 宣传片管理 ────────────────────────────────── -->
+        <div class="card space-y-3">
+          <button class="flex items-center justify-between w-full"
+                  @click="videoMgmtExpanded = !videoMgmtExpanded">
+            <h3 class="text-sm font-semibold text-gray-300">宣传片管理</h3>
+            <span class="text-xs flex items-center gap-2">
+              <span class="text-gray-500">{{ allPromoVideos.length }} 个视频</span>
+              <span class="text-gray-500">{{ videoMgmtExpanded ? '▲' : '▼' }}</span>
+            </span>
+          </button>
+
+          <template v-if="videoMgmtExpanded">
+            <!-- 上传区 -->
+            <div class="border border-dashed border-gray-700 rounded-lg px-4 py-3 space-y-2">
+              <p class="text-xs text-gray-400 font-medium">上传宣传片（MP4，每城市上限 1 GB）</p>
+              <input
+                type="file" accept=".mp4"
+                class="text-xs text-gray-300 w-full file:mr-3 file:py-1 file:px-3 file:rounded file:border-0 file:text-xs file:bg-gray-700 file:text-gray-200 hover:file:bg-gray-600"
+                @change="uploadFile = ($event.target as HTMLInputElement).files?.[0] ?? null"
+              />
+              <div v-if="uploading" class="space-y-1">
+                <div class="h-1.5 bg-gray-700 rounded-full overflow-hidden">
+                  <div class="h-full bg-blue-500 transition-all duration-300" :style="{ width: uploadProgress + '%' }" />
+                </div>
+                <p class="text-xs text-gray-400">上传中 {{ uploadProgress }}%</p>
+              </div>
+              <p v-if="uploadError" class="text-xs text-red-400">⚠ {{ uploadError }}</p>
+              <button
+                class="btn-primary text-sm"
+                :disabled="!uploadFile || uploading"
+                @click="uploadPromoVideo"
+              >{{ uploading ? '上传中…' : '上传' }}</button>
+            </div>
+
+            <!-- 视频列表 -->
+            <div v-if="allPromoVideos.length === 0" class="text-xs text-gray-500 text-center py-2">
+              暂无宣传片
+            </div>
+            <div v-for="v in allPromoVideos" :key="v.id"
+                 class="flex items-center gap-3 rounded-lg bg-gray-800/60 px-3 py-2">
+              <img v-if="v.hasThumbnail"
+                   :src="videosAPI.thumbnailUrl(cityId.value, v.id)"
+                   class="w-14 h-9 object-cover rounded shrink-0 bg-gray-700" />
+              <div v-else class="w-14 h-9 rounded bg-gray-700 shrink-0 flex items-center justify-center text-gray-600 text-[10px]">无图</div>
+              <div class="flex-1 min-w-0">
+                <p class="text-xs text-white truncate">{{ v.displayName || v.originalFilename }}</p>
+                <p class="text-[10px] mt-0.5" :class="{
+                  'text-gray-500': v.transcodeStatus === 'pending' || v.transcodeStatus === 'processing',
+                  'text-green-400': v.transcodeStatus === 'done',
+                  'text-red-400': v.transcodeStatus === 'failed',
+                }">{{ ({ pending: '等待转码', processing: '转码中…', done: `可用 · ${v.durationSeconds ?? '?'} 秒`, failed: '转码失败' } as any)[v.transcodeStatus] }}</p>
+              </div>
+              <button
+                class="text-gray-600 hover:text-red-400 transition-colors text-xs shrink-0"
+                @click="deletePromoVideo(v.id)"
+              >删除</button>
+            </div>
+          </template>
         </div>
 
         <!-- ── 告警记录 ─────────────────────────────────────── -->

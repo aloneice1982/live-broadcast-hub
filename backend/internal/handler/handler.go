@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -667,6 +668,15 @@ func (h *Handler) uploadVideo(c *gin.Context) {
 		return
 	}
 
+	// 1GB 配额校验：统计该城市上传目录已用空间
+	cityUploadDir := filepath.Join(h.cfg.UploadDir, fmt.Sprintf("%d", cityID))
+	usedBytes, _ := dirSize(cityUploadDir)
+	const maxBytes = 1 << 30 // 1 GiB
+	if usedBytes+header.Size > maxBytes {
+		fail(c, http.StatusRequestEntityTooLarge, "存储配额已满（上限 1 GB），请删除旧文件后重试")
+		return
+	}
+
 	// 生成唯一存储文件名（时间戳 + 原始名）
 	storedName := fmt.Sprintf("%d_%s", time.Now().UnixNano(), header.Filename)
 	uploadPath := filepath.Join(h.cfg.UploadDir, fmt.Sprintf("%d", cityID), storedName)
@@ -1166,4 +1176,20 @@ func normalizeMatchDatetime(s string) string {
 		}
 	}
 	return s // 无法解析时原样返回
+}
+
+// dirSize 递归统计目录下所有文件的总字节数
+func dirSize(path string) (int64, error) {
+	var total int64
+	filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, e := d.Info()
+		if e == nil {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total, nil
 }
