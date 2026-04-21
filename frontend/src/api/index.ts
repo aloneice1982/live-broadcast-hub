@@ -35,10 +35,12 @@ export const citiesAPI = {
     ),
   setMute: (cityId: number, muted: boolean) =>
     api.post(`/cities/${cityId}/ffmpeg/mute`, { muted }),
-  insertPromo: (cityId: number, promoVideoId: number) =>
+  insertPromo: (cityId: number, promoVideoId: number, loop: boolean) =>
     api.post<{ data: { inserting: boolean } }>(
-      `/cities/${cityId}/ffmpeg/insert-promo`, { promoVideoId }
+      `/cities/${cityId}/ffmpeg/insert-promo`, { promoVideoId, loop }
     ),
+  stopPromo: (cityId: number) =>
+    api.post(`/cities/${cityId}/ffmpeg/stop-promo`),
 }
 
 // ── Stream Sources ────────────────────────────────────────────
@@ -82,7 +84,7 @@ export const videosAPI = {
   rename: (cityId: number, videoId: number, displayName: string) =>
     api.put(`/cities/${cityId}/videos/${videoId}`, { displayName }),
   thumbnailUrl: (cityId: number, videoId: number) =>
-    `/api/cities/${cityId}/videos/${videoId}/thumbnail`,
+    `/api/cities/${cityId}/videos/${videoId}/thumbnail?t=${videoId}`,
   remove: (cityId: number, videoId: number) => api.delete(`/cities/${cityId}/videos/${videoId}`)
 }
 
@@ -136,6 +138,7 @@ export interface PromoVideo {
   displayName?: string; hasThumbnail: boolean
   transcodeStatus: 'pending' | 'processing' | 'done' | 'failed'
   transcodeError?: string; durationSeconds?: number; createdAt: string
+  progressPct: number
 }
 
 export interface StreamConfig {
@@ -176,6 +179,10 @@ export interface ProcessStatus {
   nextItemTime?: string
   lastStartedAt?: string   // 东八区本地时间字符串 "YYYY-MM-DD HH:MM:SS"
   promoInserting?: boolean // 是否正在插播宣传片
+  promoLoop?: boolean      // 是否循环播放
+  promoRemainingSecs?: number // 剩余秒数（循环模式为本轮剩余）
+  promoStartedAt?: string  // ISO8601 UTC 时间戳，前端用于本地实时倒计时
+  promoVideoDuration?: number // 宣传片时长（秒），前端倒计时用
 }
 
 export interface User {

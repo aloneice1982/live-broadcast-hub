@@ -51,6 +51,7 @@ const isBreakerOpen = computed(() => currentStatus.value?.status === 'breaker_op
 // ── 推流计时器（1 秒 tick）────────────────────────────────────
 const timerTick = ref(0)
 let timerInterval: ReturnType<typeof setInterval>
+let transcodeTimer: ReturnType<typeof setInterval>
 
 const streamingDuration = computed(() => {
   timerTick.value  // reactive dependency — 每秒重新计算
@@ -66,6 +67,24 @@ const streamingDuration = computed(() => {
   const m = Math.floor((secs % 3600) / 60)
   const s = secs % 60
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+})
+
+// ── 宣传片本地实时倒计时 ──────────────────────────────────────
+// 参考 streamingDuration：用服务端下发的开始时间 + 本地 timerTick 每秒重算，
+// 而不是直接展示 3 秒轮询返回的 promoRemainingSecs（会冻结）。
+// 返回值：null=未插播，-1=循环模式，>=0=剩余秒数
+const promoCountdown = computed((): number | null => {
+  timerTick.value  // reactive dependency
+  const st = currentStatus.value
+  if (!st?.promoInserting) return null
+  if (st.promoLoop) return -1  // 循环模式显示 ∞
+  const startedAt = st.promoStartedAt
+  const dur = st.promoVideoDuration ?? 0
+  if (!startedAt || dur <= 0) return st.promoRemainingSecs ?? 0  // 降级用服务端值
+  const startMs = new Date(startedAt).getTime()
+  if (isNaN(startMs)) return st.promoRemainingSecs ?? 0
+  const elapsed = Math.floor((Date.now() - startMs) / 1000)
+  return Math.max(0, dur - elapsed)
 })
 
 // ── 今日直播源 ────────────────────────────────────────────────
@@ -113,6 +132,7 @@ const promoVideos = ref<PromoVideo[]>([])       // 已转码，供插播选择
 const allPromoVideos = ref<PromoVideo[]>([])    // 全部，含转码中，供管理卡片
 const selectedPromoId = ref<number | null>(null)
 const insertingPromo = ref(false)
+const promoLoop = ref(false)  // 是否循环播放
 const promoError = ref('')
 
 // ── 宣传片上传管理 ────────────────────────────────────────────
@@ -158,6 +178,19 @@ async function loadAll() {
   pageLoading.value = false
 }
 
+// 每 3 秒刷新一次视频列表，用于在转码中时更新进度
+async function pollTranscodeProgress() {
+  const hasProcessing = allPromoVideos.value.some(
+    v => v.transcodeStatus === 'pending' || v.transcodeStatus === 'processing'
+  )
+  if (!hasProcessing) return
+  try {
+    const res = await videosAPI.list(cityId.value)
+    allPromoVideos.value = res.data.data ?? []
+    promoVideos.value = allPromoVideos.value.filter(v => v.transcodeStatus === 'done')
+  } catch { /* 静默 */ }
+}
+
 async function loadAlerts() {
   try {
     const res = await alertsAPI.list(cityId.value)
@@ -169,11 +202,20 @@ watch(cityId, loadAll, { immediate: false })
 onMounted(() => {
   loadAll()
   pollingTimer = setInterval(fetchStatus, 3000)
-  timerInterval = setInterval(() => timerTick.value++, 1000)
+  timerInterval = setInterval(() => {
+    timerTick.value++
+    // 单次插播：本地倒计时到 0 时立即刷新状态（不等 3 秒轮询）
+    // 用 promoCountdown（本地实时计算）而非陈旧的 promoRemainingSecs
+    if (!currentStatus.value?.promoLoop && promoCountdown.value === 0) {
+      fetchStatus()
+    }
+  }, 1000)
+  transcodeTimer = setInterval(pollTranscodeProgress, 3000)
 })
 onUnmounted(() => {
   clearInterval(pollingTimer)
   clearInterval(timerInterval)
+  clearInterval(transcodeTimer)
 })
 
 // ── 直推操作 ──────────────────────────────────────────────────
@@ -252,13 +294,29 @@ async function insertPromo() {
   insertingPromo.value = true
   promoError.value = ''
   try {
-    await citiesAPI.insertPromo(cityId.value, selectedPromoId.value)
+    await citiesAPI.insertPromo(cityId.value, selectedPromoId.value, promoLoop.value)
     selectedPromoId.value = null
   } catch (e: any) {
     promoError.value = e.response?.data?.error ?? '插播失败'
   } finally {
     insertingPromo.value = false
   }
+}
+
+async function stopPromo() {
+  try {
+    await citiesAPI.stopPromo(cityId.value)
+  } catch (e: any) {
+    promoError.value = e.response?.data?.error ?? '停止失败'
+  }
+}
+
+// 格式化剩余秒数为 mm:ss
+function formatRemaining(secs: number): string {
+  if (secs < 0) return '∞'
+  const m = Math.floor(secs / 60)
+  const s = secs % 60
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
 async function uploadPromoVideo() {
@@ -497,12 +555,22 @@ const statusLabel: Record<string, string> = {
 
               <!-- 插播中状态 -->
               <div v-if="currentStatus?.promoInserting"
-                   class="rounded-lg bg-purple-900/30 border border-purple-700/60 px-3 py-2.5 flex items-center gap-2">
-                <span class="w-2 h-2 rounded-full bg-purple-400 animate-pulse shrink-0" />
-                <div>
-                  <span class="text-sm font-medium text-purple-300">宣传片播放中</span>
-                  <span class="text-xs text-purple-500 ml-2">播完后自动切回直播流</span>
+                   class="rounded-lg bg-purple-900/30 border border-purple-700/60 px-3 py-2.5 space-y-2">
+                <div class="flex items-center gap-2">
+                  <span class="w-2 h-2 rounded-full bg-purple-400 animate-pulse shrink-0" />
+                  <span class="text-sm font-medium text-purple-300">
+                    {{ currentStatus.promoLoop ? '🔁 循环播放中' : '宣传片播放中' }}
+                  </span>
+                  <!-- 倒计时：使用本地实时计算的 promoCountdown，每秒平滑递减 -->
+                  <span class="ml-auto text-sm font-mono text-purple-200 tabular-nums">
+                    {{ formatRemaining(promoCountdown ?? 0) }}
+                  </span>
                 </div>
+                <p class="text-xs text-purple-500">
+                  {{ currentStatus.promoLoop ? '循环播放，需手动停止' : '播完后自动切回直播流' }}
+                </p>
+                <!-- 手动停止按钮（循环模式或提前终止） -->
+                <button class="btn-danger w-full text-sm" @click="stopPromo">⏹ 停止插播</button>
               </div>
 
               <!-- 插播选择（非插播中时显示） -->
@@ -517,13 +585,20 @@ const statusLabel: Record<string, string> = {
                       {{ v.displayName || v.originalFilename }}{{ v.durationSeconds ? ` (${v.durationSeconds}秒)` : '' }}
                     </option>
                   </select>
+                  <!-- 循环播放选项 -->
+                  <label class="flex items-center gap-2 cursor-pointer select-none text-xs text-gray-400">
+                    <input type="checkbox" v-model="promoLoop" class="accent-purple-500 w-3.5 h-3.5" />
+                    <span>循环播放（暖场模式，需手动停止）</span>
+                  </label>
                   <p v-if="promoError" class="text-xs text-red-400">⚠ {{ promoError }}</p>
                   <button
                     class="btn-primary w-full"
                     :disabled="!selectedPromoId || insertingPromo"
                     @click="insertPromo"
                   >{{ insertingPromo ? '插播中…' : '⚡ 立即插播' }}</button>
-                  <p class="text-xs text-gray-600 text-center">播放完成后自动切回直播流</p>
+                  <p class="text-xs text-gray-600 text-center">
+                    {{ promoLoop ? '循环播放，直到手动停止' : '播放完成后自动切回直播流' }}
+                  </p>
                 </template>
               </template>
             </div>
@@ -617,17 +692,31 @@ const statusLabel: Record<string, string> = {
             </div>
             <div v-for="v in allPromoVideos" :key="v.id"
                  class="flex items-center gap-3 rounded-lg bg-gray-800/60 px-3 py-2">
-              <img v-if="v.hasThumbnail"
-                   :src="videosAPI.thumbnailUrl(cityId.value, v.id)"
-                   class="w-14 h-9 object-cover rounded shrink-0 bg-gray-700" />
-              <div v-else class="w-14 h-9 rounded bg-gray-700 shrink-0 flex items-center justify-center text-gray-600 text-[10px]">无图</div>
+              <div class="w-14 h-9 rounded shrink-0 bg-gray-700 overflow-hidden flex items-center justify-center">
+                <img v-if="v.hasThumbnail"
+                     :src="videosAPI.thumbnailUrl(cityId, v.id)"
+                     class="w-full h-full object-cover"
+                     @error="(e) => { (e.target as HTMLElement).style.display='none'; (e.target as HTMLElement).nextElementSibling?.removeAttribute('style') }" />
+                <!-- 视频图标占位（无封面或图片加载失败时显示） -->
+                <svg :style="v.hasThumbnail ? 'display:none' : ''" xmlns="http://www.w3.org/2000/svg" class="w-6 h-6 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M15 10l4.553-2.277A1 1 0 0121 8.723v6.554a1 1 0 01-1.447.894L15 14M3 8a2 2 0 012-2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V8z" />
+                </svg>
+              </div>
               <div class="flex-1 min-w-0">
                 <p class="text-xs text-white truncate">{{ v.displayName || v.originalFilename }}</p>
-                <p class="text-[10px] mt-0.5" :class="{
-                  'text-gray-500': v.transcodeStatus === 'pending' || v.transcodeStatus === 'processing',
+                <!-- 转码进度条（pending / processing 时显示） -->
+                <template v-if="v.transcodeStatus === 'processing'">
+                  <div class="mt-1 h-1 bg-gray-700 rounded-full overflow-hidden w-full">
+                    <div class="h-full bg-blue-500 transition-all duration-500"
+                         :style="{ width: (v.progressPct || 0) + '%' }" />
+                  </div>
+                  <p class="text-[10px] mt-0.5 text-blue-400">转码中 {{ v.progressPct || 0 }}%</p>
+                </template>
+                <p v-else class="text-[10px] mt-0.5" :class="{
+                  'text-gray-500': v.transcodeStatus === 'pending',
                   'text-green-400': v.transcodeStatus === 'done',
                   'text-red-400': v.transcodeStatus === 'failed',
-                }">{{ ({ pending: '等待转码', processing: '转码中…', done: `可用 · ${v.durationSeconds ?? '?'} 秒`, failed: '转码失败' } as any)[v.transcodeStatus] }}</p>
+                }">{{ ({ pending: '等待转码', done: `可用 · ${v.durationSeconds ?? '?'} 秒`, failed: '转码失败' } as any)[v.transcodeStatus] }}</p>
               </div>
               <button
                 class="text-gray-600 hover:text-red-400 transition-colors text-xs shrink-0"

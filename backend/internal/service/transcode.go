@@ -16,6 +16,7 @@
 package service
 
 import (
+	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
@@ -48,6 +49,33 @@ func NewTranscodeService(db *sql.DB, cfg *config.Config) *TranscodeService {
 	}
 	go s.run()
 	return s
+}
+
+// requeuePending 启动时扫描 DB 中 pending 或 processing 的视频，重新加入转码队列
+func (s *TranscodeService) requeuePending() {
+	time.Sleep(1 * time.Second) // 等待 DB 迁移完成
+	rows, err := s.db.Query(`SELECT id FROM promotional_videos WHERE transcode_status IN ('pending','processing') ORDER BY id`)
+	if err != nil {
+		log.Printf("[transcode] requeuePending query error: %v", err)
+		return
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		// 重置 processing → pending，避免显示为卡在 processing
+		_, _ = s.db.Exec(`UPDATE promotional_videos SET transcode_status='pending' WHERE id=? AND transcode_status='processing'`, id)
+		_ = s.EnqueueVideo(id)
+		count++
+	}
+	if count > 0 {
+		log.Printf("[transcode] requeuePending: requeued %d videos on startup", count)
+	} else {
+		log.Printf("[transcode] requeuePending: no pending videos found on startup")
+	}
 }
 
 // EnqueueVideo 将 videoID 放入转码队列（非阻塞，queue 满时返回错误）
@@ -101,13 +129,46 @@ func (s *TranscodeService) process(videoID int64) {
 		return
 	}
 
-	// 4. 执行 FFmpeg 转码
+	// 4. 执行 FFmpeg 转码（带实时进度）
 	logger.Printf("start: %s → %s", video.UploadPath, outPath)
 	startAt := time.Now()
 
+	// 先用 ffprobe 获取源视频时长（用于计算进度百分比）
+	srcDuration, _ := s.probeDuration(video.UploadPath)
+
 	args := s.buildTranscodeArgs(video.UploadPath, outPath)
 	cmd := exec.CommandContext(ctx, s.cfg.FFmpegBin, args...)
-	output, err := cmd.CombinedOutput()
+
+	// 用 pipe 捕获 stderr（FFmpeg 进度输出到 stderr）
+	stderr, pipeErr := cmd.StderrPipe()
+	var output []byte
+	if pipeErr != nil {
+		// pipe 失败降级到 CombinedOutput
+		output, err = cmd.CombinedOutput()
+	} else {
+		if err = cmd.Start(); err == nil {
+			// goroutine 解析 FFmpeg stderr 进度行（time=HH:MM:SS.xx）
+			go func() {
+				scanner := bufio.NewScanner(stderr)
+				for scanner.Scan() {
+					line := scanner.Text()
+					output = append(output, []byte(line+"\n")...)
+					// FFmpeg stderr 进度行格式：frame=  xx fps= xx ... time=00:01:23.45 ...
+					if idx := strings.Index(line, "time="); idx >= 0 {
+						timeStr := strings.Fields(line[idx+5:])[0] // "HH:MM:SS.xx"
+						if secs := parseFFmpegTime(timeStr); secs > 0 && srcDuration > 0 {
+							pct := int(float64(secs) / float64(srcDuration) * 100)
+							if pct > 99 {
+								pct = 99
+							}
+							_, _ = s.db.Exec(`UPDATE promotional_videos SET progress_pct=? WHERE id=?`, pct, videoID)
+						}
+					}
+				}
+			}()
+			err = cmd.Wait()
+		}
+	}
 	if err != nil {
 		errMsg := fmt.Sprintf("ffmpeg exit: %v\noutput:\n%s", err, truncate(string(output), 1000))
 		logger.Printf("ERROR %s", errMsg)
@@ -162,7 +223,7 @@ func (s *TranscodeService) buildTranscodeArgs(inputPath, outputPath string) []st
 		"-preset", "veryfast",
 		"-profile:v", "main",
 		"-level", "4.0",
-		"-vf", fmt.Sprintf("scale=%s,fps=%s", strings.ReplaceAll(res, "x", ":"), fps),
+		"-vf", fmt.Sprintf("scale=%s,fps=%s,format=yuv420p", strings.ReplaceAll(res, "x", ":"), fps),
 		"-g", gop,
 		"-keyint_min", gop,
 		"-sc_threshold", "0", // 禁止场景切换强制关键帧
@@ -238,7 +299,7 @@ func (s *TranscodeService) markDone(ctx context.Context, id int64, outPath, thum
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE promotional_videos
 		    SET transcode_status='done', transcoded_path=?, thumbnail_path=?,
-		        duration_seconds=?, transcode_error=NULL
+		        duration_seconds=?, transcode_error=NULL, progress_pct=100
 		  WHERE id=?`,
 		outPath, thumbVal, duration, id)
 	return err
@@ -250,4 +311,17 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + "...(truncated)"
+}
+
+// parseFFmpegTime 将 FFmpeg 进度时间字符串 "HH:MM:SS.xx" 转为秒数
+func parseFFmpegTime(t string) float64 {
+	// 格式 "HH:MM:SS.xx" 或 "N/A"
+	parts := strings.Split(t, ":")
+	if len(parts) != 3 {
+		return 0
+	}
+	h, _ := strconv.ParseFloat(parts[0], 64)
+	m, _ := strconv.ParseFloat(parts[1], 64)
+	s, _ := strconv.ParseFloat(parts[2], 64)
+	return h*3600 + m*60 + s
 }

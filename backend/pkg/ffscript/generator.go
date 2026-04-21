@@ -229,6 +229,20 @@ func InjectPromoOnceArgs(transcodedPath, srsRTMPURL string) []string {
 	}
 }
 
+// InjectPromoLoopArgs 生成"宣传片循环播放注入 SRS"的 FFmpeg 参数（需手动停止）
+func InjectPromoLoopArgs(transcodedPath, srsRTMPURL string) []string {
+	return []string{
+		"-re",
+		"-stream_loop", "-1", // 无限循环
+		"-fflags", "+genpts",
+		"-i", transcodedPath,
+		"-c", "copy",
+		"-flvflags", "no_duration_filesize",
+		"-f", "flv",
+		srsRTMPURL,
+	}
+}
+
 // SRSStreamURL 构造 SRS RTMP 挂载点 URL
 // 格式: rtmp://{host}:{port}/{app}/{stream}
 func SRSStreamURL(host, port, app, stream string) string {

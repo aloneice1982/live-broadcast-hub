@@ -47,6 +47,7 @@ type PromotionalVideo struct {
 	TranscodeStatus  string    `json:"transcodeStatus"` // pending|processing|done|failed
 	TranscodeError   *string   `json:"transcodeError,omitempty"`
 	DurationSeconds  *int      `json:"durationSeconds,omitempty"`
+	ProgressPct      int       `json:"progressPct"` // 0-100，转码中实时更新
 	CreatedAt        time.Time `json:"createdAt"`
 	CreatedBy        *int64    `json:"createdBy,omitempty"`
 }

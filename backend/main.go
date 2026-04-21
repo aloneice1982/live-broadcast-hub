@@ -37,11 +37,15 @@ func main() {
 	// 3a. 迁移：补充各列（已存在时忽略报错）
 	database.Exec(`ALTER TABLE ffmpeg_processes ADD COLUMN direct_source_name TEXT`)
 	database.Exec(`ALTER TABLE stream_configs ADD COLUMN config_locked INTEGER NOT NULL DEFAULT 0`)
+	database.Exec(`ALTER TABLE promotional_videos ADD COLUMN progress_pct INTEGER NOT NULL DEFAULT 0`)
 
 	// 3b. 迁移：users 表支持 observer 角色（重建 CHECK 约束）
+	// 注意：用 PRAGMA legacy_alter_table=ON 避免 SQLite 3.26+ 自动把其他表的 FK
+	// 引用从 users 重写为 users_pre_observer，导致 DROP 后 FK 断裂。
 	var usersSchema string
 	database.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='users'`).Scan(&usersSchema)
 	if !strings.Contains(usersSchema, "'observer'") {
+		database.Exec(`PRAGMA legacy_alter_table=ON`)
 		database.Exec(`ALTER TABLE users RENAME TO users_pre_observer`)
 		database.Exec(`CREATE TABLE users (
 			id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,6 +58,7 @@ func main() {
 		)`)
 		database.Exec(`INSERT INTO users SELECT * FROM users_pre_observer`)
 		database.Exec(`DROP TABLE users_pre_observer`)
+		database.Exec(`PRAGMA legacy_alter_table=OFF`)
 		log.Printf("INFO: migrated users table to support observer role")
 	}
 

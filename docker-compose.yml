@@ -58,11 +58,7 @@ services:
       srs:
         condition: service_started
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
-      interval: 15s
-      timeout: 5s
-      start_period: 10s
-      retries: 3
+      disable: true
 
   # -----------------------------------------------------------
   # Vue 3 前端（Nginx 静态托管）

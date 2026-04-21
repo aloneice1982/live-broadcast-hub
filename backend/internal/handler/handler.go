@@ -83,6 +83,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	cityRoutes.GET("/videos/:videoId/thumbnail", h.thumbnailVideo)
 	cityRoutes.PUT("/videos/:videoId", h.updateVideo)
 	cityRoutes.DELETE("/videos/:videoId", h.deleteVideo)
+	cityRoutes.POST("/videos/:videoId/retranscode", h.retranscodeVideo)
 	cityRoutes.GET("/stream-config", h.getStreamConfig)
 	cityRoutes.PUT("/stream-config", h.updateStreamConfig)
 	cityRoutes.GET("/schedules", h.listSchedules)
@@ -97,6 +98,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	cityRoutes.POST("/ffmpeg/direct-push", h.directPush)
 	cityRoutes.POST("/ffmpeg/mute", h.setMute)
 	cityRoutes.POST("/ffmpeg/insert-promo", h.insertPromo)
+	cityRoutes.POST("/ffmpeg/stop-promo", h.stopPromo)
 	cityRoutes.POST("/alerts/clear", h.clearAlerts)
 }
 
@@ -248,7 +250,11 @@ func (h *Handler) getCityStatus(c *gin.Context) {
 		NextItemName     *string `json:"nextItemName,omitempty"`
 		NextItemTime     *string `json:"nextItemTime,omitempty"`
 		LastStartedAt    *string `json:"lastStartedAt,omitempty"`
-		PromoInserting   bool    `json:"promoInserting"`
+		PromoInserting      bool    `json:"promoInserting"`
+		PromoLoop           bool    `json:"promoLoop"`
+		PromoRemainingSecs  int     `json:"promoRemainingSecs"`
+		PromoStartedAt      string  `json:"promoStartedAt,omitempty"`
+		PromoVideoDuration  int     `json:"promoVideoDuration,omitempty"`
 	}
 	result := enrichedStatus{FFmpegProcess: fp}
 	if lastStartedAt.Valid {
@@ -261,8 +267,12 @@ func (h *Handler) getCityStatus(c *gin.Context) {
 
 	// 调度器 goroutine 是否在运行（含等待 start_time 阶段）
 	result.SchedulerActive = h.scheduler.IsRunning(cityID)
-	// 是否正在插播宣传片
-	result.PromoInserting = h.ffmpeg.IsPromoInserting(cityID)
+	// 插播宣传片状态（倒计时）
+	var promoStartedAt time.Time
+	result.PromoInserting, result.PromoLoop, result.PromoRemainingSecs, promoStartedAt, result.PromoVideoDuration = h.ffmpeg.PromoStatus(cityID)
+	if !promoStartedAt.IsZero() {
+		result.PromoStartedAt = promoStartedAt.UTC().Format(time.RFC3339)
+	}
 
 	// 当前活动排期的状态
 	if fp.ScheduleID != nil {
@@ -585,7 +595,7 @@ func (h *Handler) listVideos(c *gin.Context) {
 	rows, err := h.db.Query(
 		`SELECT id, city_id, original_filename, stored_filename,
 		        transcode_status, transcode_error, duration_seconds,
-		        display_name, thumbnail_path, created_at
+		        display_name, thumbnail_path, created_at, progress_pct
 		   FROM promotional_videos WHERE city_id=? ORDER BY created_at DESC`, cityID)
 	if err != nil {
 		fail(c, http.StatusInternalServerError, err.Error())
@@ -599,7 +609,7 @@ func (h *Handler) listVideos(c *gin.Context) {
 		var thumbPath *string
 		if err := rows.Scan(&v.ID, &v.CityID, &v.OriginalFilename, &v.StoredFilename,
 			&v.TranscodeStatus, &v.TranscodeError, &v.DurationSeconds,
-			&v.DisplayName, &thumbPath, &v.CreatedAt); err == nil {
+			&v.DisplayName, &thumbPath, &v.CreatedAt, &v.ProgressPct); err == nil {
 			v.ThumbnailPath = thumbPath
 			v.HasThumbnail = thumbPath != nil && *thumbPath != ""
 			videos = append(videos, v)
@@ -691,7 +701,7 @@ func (h *Handler) uploadVideo(c *gin.Context) {
 		return
 	}
 	defer dst.Close()
-	if _, err := io.Copy(dst, file); err != nil {
+	if _, err := io.CopyBuffer(dst, file, make([]byte, 1024*1024)); err != nil {
 		fail(c, http.StatusInternalServerError, "write file failed")
 		return
 	}
@@ -742,7 +752,39 @@ func (h *Handler) deleteVideo(c *gin.Context) {
 	ok(c, gin.H{"deleted": true})
 }
 
-// ── Stream Config ───────────────────────────────────────────────
+func (h *Handler) retranscodeVideo(c *gin.Context) {
+	cityID, err := cityIDFromParam(c)
+	if err != nil || !assertCityAccess(c, cityID) {
+		return
+	}
+	videoID, _ := strconv.ParseInt(c.Param("videoId"), 10, 64)
+
+	var uploadPath string
+	var status string
+	err = h.db.QueryRow(`SELECT upload_path, transcode_status FROM promotional_videos WHERE id=? AND city_id=?`,
+		videoID, cityID).Scan(&uploadPath, &status)
+	if err != nil {
+		fail(c, http.StatusNotFound, "video not found")
+		return
+	}
+	if status == "processing" {
+		fail(c, http.StatusConflict, "transcode already in progress")
+		return
+	}
+	if _, err := os.Stat(uploadPath); err != nil {
+		fail(c, http.StatusGone, "source file not found on disk")
+		return
+	}
+
+	_, _ = h.db.Exec(`UPDATE promotional_videos SET transcode_status='pending', transcode_error=NULL WHERE id=?`, videoID)
+	if err := h.transcode.EnqueueVideo(videoID); err != nil {
+		fail(c, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	ok(c, gin.H{"queued": true})
+}
+
+
 
 func (h *Handler) getStreamConfig(c *gin.Context) {
 	cityID, err := cityIDFromParam(c)

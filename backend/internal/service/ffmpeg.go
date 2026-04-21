@@ -115,17 +115,20 @@ func classifyFFmpegErr(exitErr error, lastLine string) string {
 
 // citySession 代表某个地市的完整推流会话
 type citySession struct {
-	cityID           int64
-	scheduleID       int64
-	inject           *managedProc // 主 inject 进程（直播流）
-	injectPromo      *managedProc // 宣传片插播进程（临时，播完自动退出）
-	push             *managedProc
-	retries          int
-	mu               sync.Mutex
-	ctx              context.Context
-	cancel           context.CancelFunc
-	currentSourceURL string // 当前 inject 进程使用的直播源 URL（静音切换时复用）
-	isMuted          bool
+	cityID              int64
+	scheduleID          int64
+	inject              *managedProc // 主 inject 进程（直播流）
+	injectPromo         *managedProc // 宣传片插播进程（临时，播完自动退出或手动停止）
+	push                *managedProc
+	retries             int
+	mu                  sync.Mutex
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	currentSourceURL    string // 当前 inject 进程使用的直播源 URL（静音切换时复用）
+	isMuted             bool
+	promoStartedAt      time.Time // 宣传片插播开始时间
+	promoVideoDuration  int       // 宣传片时长（秒），用于倒计时
+	promoLoop           bool      // 是否循环播放
 }
 
 // FFmpegService 管理所有地市的推流进程
@@ -308,6 +311,57 @@ func (s *FFmpegService) IsPromoInserting(cityID int64) bool {
 	return sess.injectPromo != nil
 }
 
+// PromoStatus 返回当前插播状态：是否插播中、是否循环、剩余秒数、开始时间、视频时长
+func (s *FFmpegService) PromoStatus(cityID int64) (inserting bool, loop bool, remainingSecs int, startedAt time.Time, videoDuration int) {
+	s.mu.RLock()
+	sess, ok := s.sessions[cityID]
+	s.mu.RUnlock()
+	if !ok {
+		return false, false, 0, time.Time{}, 0
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.injectPromo == nil {
+		return false, false, 0, time.Time{}, 0
+	}
+	if sess.promoLoop {
+		// 循环模式：计算本轮剩余
+		elapsed := int(time.Since(sess.promoStartedAt).Seconds())
+		dur := sess.promoVideoDuration
+		if dur <= 0 {
+			return true, true, -1, sess.promoStartedAt, dur
+		}
+		rem := dur - (elapsed % dur)
+		return true, true, rem, sess.promoStartedAt, dur
+	}
+	// 单次模式：总时长 - 已过时间
+	elapsed := int(time.Since(sess.promoStartedAt).Seconds())
+	rem := sess.promoVideoDuration - elapsed
+	if rem <= 0 {
+		// 时间已到，视为不在插播状态（watchdogPromo 很快会设 injectPromo=nil）
+		return false, false, 0, time.Time{}, 0
+	}
+	return true, false, rem, sess.promoStartedAt, sess.promoVideoDuration
+}
+
+// StopPromoInsert 手动停止插播（用于循环模式）
+func (s *FFmpegService) StopPromoInsert(cityID int64) error {
+	s.mu.RLock()
+	sess, ok := s.sessions[cityID]
+	s.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("city %d: no active session", cityID)
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.injectPromo == nil {
+		return fmt.Errorf("no promo playing")
+	}
+	sess.injectPromo.discarded = true
+	s.killProc(sess.injectPromo)
+	return nil
+}
+
 // SetMute 切换静音状态：以 gain=0（静音）或原始 gain 重启 inject 进程，push 进程不受影响
 func (s *FFmpegService) SetMute(cityID int64, muted bool) error {
 	s.mu.RLock()
@@ -351,8 +405,8 @@ func (s *FFmpegService) SetMute(cityID int64, muted bool) error {
 }
 
 // StartPromoInsert 启动宣传片插播（播放一次后自动退出）
-// 插播期间 inject 进程继续拉流但不推（保持连接），push 进程从 SRS 拉取宣传片流
-func (s *FFmpegService) StartPromoInsert(cityID int64, promoVideoID int64) error {
+// 插播期间先暂停 inject 进程释放 SRS 推流槽，播完后恢复
+func (s *FFmpegService) StartPromoInsert(cityID int64, promoVideoID int64, loop bool) error {
 	s.mu.RLock()
 	sess, ok := s.sessions[cityID]
 	s.mu.RUnlock()
@@ -367,55 +421,93 @@ func (s *FFmpegService) StartPromoInsert(cityID int64, promoVideoID int64) error
 		return fmt.Errorf("promo already playing")
 	}
 
-	// 1. 查询宣传片路径
+	// 1. 查询宣传片路径和时长
 	var transcodedPath string
 	var cityCode string
+	var videoDuration int
 	err := s.db.QueryRow(
-		`SELECT pv.transcoded_path, c.code
+		`SELECT pv.transcoded_path, c.code, COALESCE(pv.duration_seconds, 0)
 		   FROM promotional_videos pv
 		   JOIN cities c ON pv.city_id = c.id
 		  WHERE pv.id=? AND pv.city_id=? AND pv.transcode_status='done'`,
 		promoVideoID, cityID,
-	).Scan(&transcodedPath, &cityCode)
+	).Scan(&transcodedPath, &cityCode, &videoDuration)
 	if err != nil {
 		return fmt.Errorf("promo video not found or not transcoded")
 	}
 
-	// 2. 构建 inject-promo 命令（播放 1 次）
-	srsURL := fmt.Sprintf("rtmp://%s:%s/live/%s", s.cfg.SRSHost, s.cfg.SRSRTMPPort, cityCode)
-	args := ffscript.InjectPromoOnceArgs(transcodedPath, srsURL)
+	// 2. 暂停 inject 进程，释放 SRS 推流槽给宣传片
+	oldInject := sess.inject
+	if oldInject != nil {
+		oldInject.discarded = true // 不让 watchdog 自动重启
+		s.killProc(oldInject)
+		sess.inject = nil
+	}
 
-	// 3. 启动 inject-promo 进程
+	// 3. 构建 inject-promo 命令（播放 1 次）
+	srsURL := fmt.Sprintf("rtmp://%s:%s/live/%s", s.cfg.SRSHost, s.cfg.SRSRTMPPort, cityCode)
+	var args []string
+	if loop {
+		args = ffscript.InjectPromoLoopArgs(transcodedPath, srsURL)
+	} else {
+		args = ffscript.InjectPromoOnceArgs(transcodedPath, srsURL)
+	}
+
+	// 4. 启动 inject-promo 进程
 	if err := s.startProc(sess, procTypeInjectPromo, args); err != nil {
+		// 启动失败，立即恢复 inject 进程
+		if oldInject != nil {
+			_ = s.startProc(sess, procTypeInject, oldInject.args)
+		}
 		return fmt.Errorf("start inject-promo: %w", err)
 	}
 
-	// 4. 启动专用 watchdog（播完自动退出，不重启）
-	go s.watchdogPromo(sess, sess.injectPromo)
+	// 记录插播元数据（用于倒计时）
+	sess.promoStartedAt = time.Now()
+	sess.promoVideoDuration = videoDuration
+	sess.promoLoop = loop
 
-	s.logger.Printf("city=%d promo insert started (video_id=%d)", cityID, promoVideoID)
+	// 5. 启动专用 watchdog（播完自动退出，恢复 inject）
+	go s.watchdogPromo(sess, sess.injectPromo, oldInject)
+
+	s.logger.Printf("city=%d promo insert started (video_id=%d, loop=%v)", cityID, promoVideoID, loop)
 	return nil
 }
 
-// watchdogPromo 监控宣传片插播进程（播完自动退出，不重启）
-func (s *FFmpegService) watchdogPromo(sess *citySession, mp *managedProc) {
+// watchdogPromo 监控宣传片插播进程（播完自动退出，恢复 inject）
+func (s *FFmpegService) watchdogPromo(sess *citySession, mp *managedProc, oldInject *managedProc) {
 	err := mp.cmd.Wait()
 	close(mp.done)
 
 	sess.mu.Lock()
 	defer sess.mu.Unlock()
 
-	// 播完自动退出（exit code 0），清理进程，不重启
+	sess.injectPromo = nil
+
+	// 无论正常还是异常退出，都恢复 inject 进程
+	if oldInject != nil && sess.ctx.Err() == nil {
+		if startErr := s.startProc(sess, procTypeInject, oldInject.args); startErr != nil {
+			s.logger.Printf("city=%d promo: restore inject failed: %v", sess.cityID, startErr)
+		} else {
+			go s.watchdog(sess, sess.inject)
+			s.logger.Printf("city=%d promo: inject restored", sess.cityID)
+		}
+	}
+
 	if mp.cmd.ProcessState != nil && mp.cmd.ProcessState.ExitCode() == 0 {
-		sess.injectPromo = nil
 		s.logger.Printf("city=%d promo insert finished normally", sess.cityID)
 		return
 	}
 
-	// 异常退出，记录告警但不重启
+	// 被 StopPromoInsert 主动 kill（discarded=true），不算异常
+	if mp.discarded {
+		s.logger.Printf("city=%d promo insert stopped manually", sess.cityID)
+		return
+	}
+
+	// 异常退出，记录告警
 	reason := classifyFFmpegErr(err, mp.stderrBuf.LastMeaningful())
 	_ = s.logAlert(sess.cityID, "warn", fmt.Sprintf("宣传片插播异常退出：%s", reason))
-	sess.injectPromo = nil
 	s.logger.Printf("city=%d promo insert failed: %v", sess.cityID, err)
 }
 
@@ -430,6 +522,16 @@ func (s *FFmpegService) startProc(sess *citySession, procType string, args []str
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("exec start [%s]: %w", procType, err)
+	}
+
+	// 降低 FFmpeg 进程的 OOM 优先级，避免系统内存紧张时被 OOM Killer 优先 kill
+	// oom_score_adj 范围 -1000（永不 kill）到 1000（优先 kill），默认 0
+	// -500 表示比普通进程更难被 kill，同时不影响系统在极端情况下的回收能力
+	if pid := cmd.Process.Pid; pid > 0 {
+		oomPath := fmt.Sprintf("/proc/%d/oom_score_adj", pid)
+		if err := os.WriteFile(oomPath, []byte("-500"), 0644); err != nil {
+			s.logger.Printf("WARN: set oom_score_adj for pid %d failed: %v", pid, err)
+		}
 	}
 
 	mp := &managedProc{
