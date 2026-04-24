@@ -1,0 +1,77 @@
+services:
+  # -----------------------------------------------------------
+  # SRS 流媒体服务器
+  # -----------------------------------------------------------
+  srs:
+    image: ossrs/srs:5
+    container_name: susuper-srs
+    restart: unless-stopped
+    ports:
+      - "${RTMP_PORT:-1935}:1935"
+      - "${SRS_API_PORT:-1985}:1985"
+      - "${SRS_HTTP_PORT:-8088}:8080"
+    volumes:
+      - srs_conf:/usr/local/srs/conf
+      - srs_dvr:/usr/local/srs/objs/nginx/html
+    command: >
+      sh -c "echo 'listen 1935;
+      max_connections 1000;
+      daemon off;
+      http_api { enabled on; listen 1985; }
+      http_server { enabled on; listen 8080; dir ./objs/nginx/html; }
+      vhost __defaultVhost__ {
+        http_hooks { enabled on; on_publish http://backend:${APP_PORT:-8080}/hooks/srs/publish; on_unpublish http://backend:${APP_PORT:-8080}/hooks/srs/unpublish; }
+      }' > /usr/local/srs/conf/srs.conf && ./objs/srs -c /usr/local/srs/conf/srs.conf"
+
+  # -----------------------------------------------------------
+  # Go 后端服务
+  # -----------------------------------------------------------
+  backend:
+    image: ghcr.io/aloneice1982/live-broadcast-hub/backend:latest
+    container_name: susuper-backend
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - susuper_uploads:/app/data/uploads
+      - susuper_transcoded:/app/data/transcoded
+      - susuper_db:/app/data/db
+    environment:
+      - SRS_HOST=srs
+      - SRS_RTMP_PORT=1935
+      - SRS_API_PORT=1985
+      - DB_PATH=/app/data/db/susuper.db
+      - UPLOAD_DIR=/app/data/uploads
+      - TRANSCODE_DIR=/app/data/transcoded
+      - TRANSCODE_CONCURRENCY=2
+      - FFMPEG_MAX_RETRIES=3
+      - FFMPEG_RETRY_DELAY_SECONDS=3
+      - TZ=Asia/Shanghai
+    depends_on:
+      - srs
+    healthcheck:
+      disable: true
+
+  # -----------------------------------------------------------
+  # Vue 3 前端（Nginx 静态托管）
+  # -----------------------------------------------------------
+  frontend:
+    image: ghcr.io/aloneice1982/live-broadcast-hub/frontend:latest
+    container_name: susuper-frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3080}:80"
+    depends_on:
+      - backend
+
+volumes:
+  susuper_uploads:
+  susuper_transcoded:
+  susuper_db:
+  srs_conf:
+  srs_dvr:
+
+networks:
+  default:
+    name: susuper-net
