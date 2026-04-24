@@ -484,13 +484,33 @@ func (s *FFmpegService) watchdogPromo(sess *citySession, mp *managedProc, oldInj
 
 	sess.injectPromo = nil
 
-	// 无论正常还是异常退出，都恢复 inject 进程
+	// 无论正常还是异常退出，都恢复 inject 进程（带重试，绝不留黑屏）
 	if oldInject != nil && sess.ctx.Err() == nil {
-		if startErr := s.startProc(sess, procTypeInject, oldInject.args); startErr != nil {
-			s.logger.Printf("city=%d promo: restore inject failed: %v", sess.cityID, startErr)
-		} else {
-			go s.watchdog(sess, sess.inject)
-			s.logger.Printf("city=%d promo: inject restored", sess.cityID)
+		const maxRestoreRetries = 3
+		var restoreErr error
+		for i := 0; i < maxRestoreRetries; i++ {
+			if i > 0 {
+				sess.mu.Unlock()
+				time.Sleep(2 * time.Second)
+				sess.mu.Lock()
+				if sess.ctx.Err() != nil {
+					break
+				}
+			}
+			restoreErr = s.startProc(sess, procTypeInject, oldInject.args)
+			if restoreErr == nil {
+				// startProc 内部已为 procTypeInject 启动 watchdog，不重复调用
+				s.logger.Printf("city=%d promo: inject restored (attempt %d)", sess.cityID, i+1)
+				break
+			}
+			s.logger.Printf("city=%d promo: restore inject attempt %d/%d failed: %v",
+				sess.cityID, i+1, maxRestoreRetries, restoreErr)
+		}
+		if restoreErr != nil {
+			msg := fmt.Sprintf("【严重】宣传片插播失败且直播恢复失败，城市ID=%d，请立即手动重启推流", sess.cityID)
+			_ = s.logAlert(sess.cityID, "critical", msg)
+			go s.sms.SendCityAlert(sess.cityID, msg)
+			s.logger.Printf("city=%d CRITICAL: inject restore all retries failed", sess.cityID)
 		}
 	}
 
