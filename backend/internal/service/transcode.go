@@ -150,6 +150,18 @@ func (s *TranscodeService) process(videoID int64) {
 			// goroutine 解析 FFmpeg stderr 进度行（time=HH:MM:SS.xx）
 			go func() {
 				scanner := bufio.NewScanner(stderr)
+				// FFmpeg 进度行以 \r 结尾（非 \n），自定义分割函数同时处理 \r 和 \n
+				scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+					for i, b := range data {
+						if b == '\r' || b == '\n' {
+							return i + 1, data[:i], nil
+						}
+					}
+					if atEOF && len(data) > 0 {
+						return len(data), data, nil
+					}
+					return 0, nil, nil
+				})
 				for scanner.Scan() {
 					line := scanner.Text()
 					output = append(output, []byte(line+"\n")...)
