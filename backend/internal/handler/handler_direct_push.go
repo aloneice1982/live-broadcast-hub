@@ -47,19 +47,6 @@ func (h *Handler) directPush(c *gin.Context) {
 		return
 	}
 
-	// 带宽保护：上行带宽 ≥ 80 Mbps 时拒绝新推流（泰州特权豁免）
-	var cityCode string
-	h.db.QueryRow(`SELECT code FROM cities WHERE id=?`, cityID).Scan(&cityCode)
-	if cityCode != "tz" {
-		globalNetStats.mu.RLock()
-		uploadMbps := globalNetStats.UploadMbps
-		globalNetStats.mu.RUnlock()
-		if uploadMbps >= 80.0 {
-			fail(c, http.StatusServiceUnavailable, "SERVER_BANDWIDTH_FULL")
-			return
-		}
-	}
-
 	// 停止可能存在的旧进程
 	h.ffmpeg.StopCity(cityID)
 
