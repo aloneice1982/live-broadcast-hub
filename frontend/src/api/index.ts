@@ -123,6 +123,12 @@ export const systemAPI = {
   metrics: () => api.get<{ data: { uploadMbps: number; downloadMbps: number } }>('/system/metrics')
 }
 
+// ── Audit Logs ────────────────────────────────────────────────
+export const auditAPI = {
+  list: (params?: { page?: number; page_size?: number; action?: string; username?: string }) =>
+    api.get<{ data: { total: number; logs: AuditLog[] } }>('/audit-logs', { params })
+}
+
 // ── 类型定义 ──────────────────────────────────────────────────
 
 export interface City { id: number; name: string; code: string }
@@ -192,4 +198,9 @@ export interface User {
 export interface AlertLog {
   id: number; cityId: number; level: 'warn' | 'error' | 'critical'
   message: string; smsSent: boolean; createdAt: string
+}
+
+export interface AuditLog {
+  id: number; userId?: number; username: string; role: string
+  action: string; detail: string; ip: string; createdAt: string
 }

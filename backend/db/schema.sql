@@ -171,3 +171,20 @@ CREATE TABLE IF NOT EXISTS alert_logs (
 );
 
 CREATE INDEX IF NOT EXISTS idx_alert_city ON alert_logs (city_id, created_at DESC);
+
+-- -------------------------------------------------------------
+-- 操作审计日志（登录、流控、用户管理等关键操作）
+-- -------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER,                        -- 操作者 ID（登录失败时可能为 NULL）
+    username   TEXT    NOT NULL,               -- 操作者用户名
+    role       TEXT    NOT NULL DEFAULT '',    -- 操作者角色
+    action     TEXT    NOT NULL,               -- 操作类型，如 LOGIN / LOGIN_FAIL / START_STREAM
+    detail     TEXT    NOT NULL DEFAULT '',    -- 附加说明
+    ip         TEXT    NOT NULL DEFAULT '',    -- 客户端 IP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs (username);

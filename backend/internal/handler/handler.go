@@ -75,6 +75,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	superOnly.POST("/stream-sources", h.createStreamSource)
 	superOnly.PUT("/stream-sources/:id", h.updateStreamSource)
 	superOnly.DELETE("/stream-sources/:id", h.deleteStreamSource)
+	superOnly.GET("/audit-logs", h.listAuditLogs)
 
 	// 地市管理员（city_admin 只能操作自己城市，super_admin 可操作所有）
 	cityRoutes := authed.Group("/cities/:cityId")
@@ -143,6 +144,24 @@ func assertCityAccess(c *gin.Context, cityID int64) bool {
 	return true
 }
 
+// writeAuditLog 写入操作审计日志（fire-and-forget，失败不影响主流程）
+func (h *Handler) writeAuditLog(userID *int64, username, role, action, detail, ip string) {
+	h.db.Exec( //nolint:errcheck
+		`INSERT INTO audit_logs (user_id, username, role, action, detail, ip) VALUES (?,?,?,?,?,?)`,
+		userID, username, role, action, detail, ip,
+	)
+}
+
+// callerInfo 从 JWT context 取出操作者信息（用于非 login 路由）
+func (h *Handler) callerInfo(c *gin.Context) (int64, string, string) {
+	uid, _ := c.Get("userID")
+	roleVal, _ := c.Get("role")
+	userID := uid.(int64)
+	var username string
+	h.db.QueryRow(`SELECT username FROM users WHERE id=?`, userID).Scan(&username) //nolint:errcheck
+	return userID, username, roleVal.(string)
+}
+
 // ── Health ──────────────────────────────────────────────────────
 
 func (h *Handler) health(c *gin.Context) {
@@ -167,11 +186,13 @@ func (h *Handler) login(c *gin.Context) {
 	row := h.db.QueryRow(
 		`SELECT id, username, password_hash, role, city_id FROM users WHERE username=?`, req.Username)
 	if err := row.Scan(&user.ID, &user.Username, &user.PasswordHash, &user.Role, &user.CityID); err != nil {
+		h.writeAuditLog(nil, req.Username, "", "LOGIN_FAIL", "用户不存在", c.ClientIP())
 		fail(c, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 
 	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(req.Password)); err != nil {
+		h.writeAuditLog(&user.ID, user.Username, user.Role, "LOGIN_FAIL", "密码错误", c.ClientIP())
 		fail(c, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -192,6 +213,7 @@ func (h *Handler) login(c *gin.Context) {
 		return
 	}
 
+	h.writeAuditLog(&user.ID, user.Username, user.Role, "LOGIN", "", c.ClientIP())
 	ok(c, gin.H{"token": signed, "user": user})
 }
 
@@ -408,6 +430,8 @@ func (h *Handler) createUser(c *gin.Context) {
 	}
 
 	id, _ := res.LastInsertId()
+	callerUID, callerName, callerRole := h.callerInfo(c)
+	h.writeAuditLog(&callerUID, callerName, callerRole, "CREATE_USER", "新用户: "+req.Username+"("+req.Role+")", c.ClientIP())
 	ok(c, gin.H{"id": id})
 }
 
@@ -1234,4 +1258,54 @@ func dirSize(path string) (int64, error) {
 		return nil
 	})
 	return total, nil
+}
+
+// ── Audit Logs ──────────────────────────────────────────────────
+
+func (h *Handler) listAuditLogs(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
+	action := c.Query("action")
+	username := c.Query("username")
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 || pageSize > 200 {
+		pageSize = 50
+	}
+	offset := (page - 1) * pageSize
+
+	where := "WHERE 1=1"
+	args := []interface{}{}
+	if action != "" {
+		where += " AND action=?"
+		args = append(args, action)
+	}
+	if username != "" {
+		where += " AND username LIKE ?"
+		args = append(args, "%"+username+"%")
+	}
+
+	var total int
+	h.db.QueryRow("SELECT COUNT(*) FROM audit_logs "+where, args...).Scan(&total) //nolint:errcheck
+
+	queryArgs := append(args, pageSize, offset)
+	rows, err := h.db.Query(
+		"SELECT id, user_id, username, role, action, detail, ip, "+
+			"strftime('%Y-%m-%d %H:%M:%S', created_at) FROM audit_logs "+
+			where+" ORDER BY created_at DESC LIMIT ? OFFSET ?",
+		queryArgs...)
+	if err != nil {
+		fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer rows.Close()
+
+	logs := make([]model.AuditLog, 0)
+	for rows.Next() {
+		var l model.AuditLog
+		rows.Scan(&l.ID, &l.UserID, &l.Username, &l.Role, &l.Action, &l.Detail, &l.IP, &l.CreatedAt) //nolint:errcheck
+		logs = append(logs, l)
+	}
+	ok(c, gin.H{"total": total, "logs": logs})
 }

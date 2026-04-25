@@ -64,5 +64,7 @@ func (h *Handler) directPush(c *gin.Context) {
 	// 将直播源名称写入 DB，供 getCityStatus 的 currentItemName 展示
 	h.db.Exec(`UPDATE ffmpeg_processes SET direct_source_name=? WHERE city_id=?`, sourceName, cityID)
 
+	callerUID, callerName, callerRole := h.callerInfo(c)
+	h.writeAuditLog(&callerUID, callerName, callerRole, "START_STREAM", "直推: "+sourceName, c.ClientIP())
 	ok(c, gin.H{"started": true, "sourceName": sourceName})
 }

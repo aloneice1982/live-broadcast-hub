@@ -5,15 +5,15 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  citiesAPI, streamSourcesAPI, usersAPI, systemAPI,
-  type City, type ProcessStatus, type StreamSource, type User
+  citiesAPI, streamSourcesAPI, usersAPI, systemAPI, auditAPI,
+  type City, type ProcessStatus, type StreamSource, type User, type AuditLog
 } from '@/api'
 import { useAuthStore } from '@/stores/auth'
 
 const router = useRouter()
 const auth = useAuthStore()
 const isObserver = computed(() => auth.user?.role === 'observer')
-const activeTab = ref<'overview' | 'sources' | 'users'>('overview')
+const activeTab = ref<'overview' | 'sources' | 'users' | 'logs'>('overview')
 
 // ── 地市状态 ──────────────────────────────────────────────────
 const cities = ref<City[]>([])
@@ -265,8 +265,56 @@ async function savePassword(userId: number) {
 
 function logout() { auth.logout(); router.push('/login') }
 
+// ── 操作日志 ──────────────────────────────────────────────────
+const auditLogs = ref<AuditLog[]>([])
+const auditTotal = ref(0)
+const auditPage = ref(1)
+const auditPageSize = 50
+const auditFilterAction = ref('')
+const auditFilterUser = ref('')
+let auditTimer: ReturnType<typeof setInterval>
+
+async function loadAuditLogs() {
+  try {
+    const res = await auditAPI.list({
+      page: auditPage.value,
+      page_size: auditPageSize,
+      action: auditFilterAction.value || undefined,
+      username: auditFilterUser.value || undefined,
+    })
+    auditLogs.value = res.data.data.logs
+    auditTotal.value = res.data.data.total
+  } catch { /* 静默 */ }
+}
+
+function auditSearch() {
+  auditPage.value = 1
+  loadAuditLogs()
+}
+
+function auditPrevPage() {
+  if (auditPage.value > 1) { auditPage.value--; loadAuditLogs() }
+}
+function auditNextPage() {
+  if (auditPage.value * auditPageSize < auditTotal.value) { auditPage.value++; loadAuditLogs() }
+}
+
+const auditActionBadge: Record<string, string> = {
+  LOGIN: 'bg-green-900/60 text-green-300',
+  LOGIN_FAIL: 'bg-red-900/60 text-red-300',
+  START_STREAM: 'bg-blue-900/60 text-blue-300',
+  STOP_STREAM: 'bg-gray-700 text-gray-300',
+  CREATE_USER: 'bg-orange-900/60 text-orange-300',
+  DELETE_USER: 'bg-red-900/60 text-red-300',
+  CHANGE_PASSWORD: 'bg-yellow-900/60 text-yellow-300',
+}
+function auditBadgeClass(action: string) {
+  return auditActionBadge[action] ?? 'bg-gray-700 text-gray-300'
+}
+
 onMounted(() => {
   loadCities(); loadSources(); loadUsers(); fetchBandwidth()
+  if (!isObserver.value) { loadAuditLogs(); auditTimer = setInterval(loadAuditLogs, 30000) }
   pollingTimer = setInterval(fetchAllStatuses, 5000)
   tickTimer = setInterval(() => tick.value++, 1000)
   bandwidthTimer = setInterval(fetchBandwidth, 5000)
@@ -275,6 +323,7 @@ onUnmounted(() => {
   clearInterval(pollingTimer)
   clearInterval(tickTimer)
   clearInterval(bandwidthTimer)
+  clearInterval(auditTimer)
 })
 </script>
 
@@ -296,7 +345,7 @@ onUnmounted(() => {
       <!-- 选项卡（隐藏"排期管理"） -->
       <div class="flex gap-1 mb-6 bg-gray-900 border border-gray-800 rounded-xl p-1 w-fit">
         <button
-          v-for="tab in (isObserver ? [{ key: 'overview', label: '全省大盘' }] : [{ key: 'overview', label: '全省大盘' }, { key: 'sources', label: '直播源管理' }, { key: 'users', label: '用户管理' }])"
+          v-for="tab in (isObserver ? [{ key: 'overview', label: '全省大盘' }] : [{ key: 'overview', label: '全省大盘' }, { key: 'sources', label: '直播源管理' }, { key: 'users', label: '用户管理' }, { key: 'logs', label: '操作日志' }])"
           :key="tab.key"
           class="px-4 py-1.5 rounded-lg text-sm font-medium transition-colors"
           :class="activeTab === tab.key ? 'bg-blue-600 text-white' : 'text-gray-400 hover:text-gray-200'"
@@ -613,6 +662,87 @@ onUnmounted(() => {
           </table>
         </div>
       </div>
+
+      <!-- ── 操作日志 ── -->
+      <div v-if="activeTab === 'logs'">
+        <div class="card p-4 mb-4">
+          <h2 class="font-semibold text-white mb-3">操作审计日志</h2>
+          <!-- 筛选行 -->
+          <div class="flex flex-wrap gap-3 mb-4">
+            <select
+              v-model="auditFilterAction"
+              class="input-sm bg-gray-800 border-gray-700 text-gray-200 rounded-lg px-3 py-1.5 text-sm"
+            >
+              <option value="">全部操作</option>
+              <option value="LOGIN">登录成功</option>
+              <option value="LOGIN_FAIL">登录失败</option>
+              <option value="START_STREAM">开始推流</option>
+              <option value="STOP_STREAM">停止推流</option>
+              <option value="CREATE_USER">创建用户</option>
+              <option value="DELETE_USER">删除用户</option>
+              <option value="CHANGE_PASSWORD">重置密码</option>
+            </select>
+            <input
+              v-model="auditFilterUser"
+              type="text"
+              placeholder="用户名搜索…"
+              class="input-sm bg-gray-800 border border-gray-700 text-gray-200 rounded-lg px-3 py-1.5 text-sm w-40 outline-none focus:border-blue-500"
+            />
+            <button class="btn-sm bg-blue-700 hover:bg-blue-600 text-white rounded-lg px-4 py-1.5 text-sm" @click="auditSearch">查询</button>
+            <span class="text-xs text-gray-500 self-center ml-auto">共 {{ auditTotal }} 条记录，第 {{ auditPage }} 页</span>
+          </div>
+
+          <!-- 日志表格 -->
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm text-left">
+              <thead>
+                <tr class="border-b border-gray-800 text-gray-400 text-xs uppercase tracking-wide">
+                  <th class="pb-2 pr-4">时间</th>
+                  <th class="pb-2 pr-4">用户</th>
+                  <th class="pb-2 pr-4">角色</th>
+                  <th class="pb-2 pr-4">操作</th>
+                  <th class="pb-2 pr-4">详情</th>
+                  <th class="pb-2">IP</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="log in auditLogs"
+                  :key="log.id"
+                  class="border-b border-gray-800/50 hover:bg-gray-800/30 transition-colors"
+                >
+                  <td class="py-2 pr-4 font-mono text-xs text-gray-400 whitespace-nowrap">{{ log.createdAt }}</td>
+                  <td class="py-2 pr-4 font-medium text-gray-200">{{ log.username }}</td>
+                  <td class="py-2 pr-4 text-gray-400 text-xs">{{ log.role }}</td>
+                  <td class="py-2 pr-4">
+                    <span class="px-2 py-0.5 rounded text-xs font-medium" :class="auditBadgeClass(log.action)">{{ log.action }}</span>
+                  </td>
+                  <td class="py-2 pr-4 text-gray-400 text-xs max-w-xs truncate">{{ log.detail }}</td>
+                  <td class="py-2 font-mono text-xs text-gray-500">{{ log.ip }}</td>
+                </tr>
+                <tr v-if="auditLogs.length === 0">
+                  <td colspan="6" class="py-8 text-center text-gray-600 text-sm">暂无日志数据</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- 分页 -->
+          <div class="flex justify-center gap-3 mt-4">
+            <button
+              class="btn-sm bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg px-4 py-1.5 text-sm disabled:opacity-40"
+              :disabled="auditPage <= 1"
+              @click="auditPrevPage"
+            >← 上一页</button>
+            <button
+              class="btn-sm bg-gray-800 hover:bg-gray-700 text-gray-300 rounded-lg px-4 py-1.5 text-sm disabled:opacity-40"
+              :disabled="auditPage * auditPageSize >= auditTotal"
+              @click="auditNextPage"
+            >下一页 →</button>
+          </div>
+        </div>
+      </div>
+
     </main>
   </div>
 </template>

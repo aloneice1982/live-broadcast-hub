@@ -102,7 +102,7 @@ type FFmpegProcess struct {
 	RetryCount    int     `json:"retryCount"`
 }
 
-// ── AlertLog ─��────────────────────────────────────────────────
+// ── AlertLog ─────────────────────────────────────────────────
 type AlertLog struct {
 	ID        int64     `json:"id"`
 	CityID    int64     `json:"cityId"`
@@ -110,4 +110,16 @@ type AlertLog struct {
 	Message   string    `json:"message"`
 	SMSSent   bool      `json:"smsSent"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ── AuditLog ──────────────────────────────────────────────────
+type AuditLog struct {
+	ID        int64  `json:"id"`
+	UserID    *int64 `json:"userId,omitempty"`
+	Username  string `json:"username"`
+	Role      string `json:"role"`
+	Action    string `json:"action"`
+	Detail    string `json:"detail"`
+	IP        string `json:"ip"`
+	CreatedAt string `json:"createdAt"`
 }

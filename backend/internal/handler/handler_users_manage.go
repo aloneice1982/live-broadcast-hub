@@ -50,6 +50,8 @@ func (h *Handler) deleteUser(c *gin.Context) {
 		return
 	}
 
+	callerUID, callerName, callerRole := h.callerInfo(c)
+	h.writeAuditLog(&callerUID, callerName, callerRole, "DELETE_USER", "删除用户 ID: "+strconv.FormatInt(targetID, 10), c.ClientIP())
 	ok(c, gin.H{"deleted": true})
 }
 
@@ -94,5 +96,7 @@ func (h *Handler) changePassword(c *gin.Context) {
 		return
 	}
 
+	callerUID, callerName, callerRole := h.callerInfo(c)
+	h.writeAuditLog(&callerUID, callerName, callerRole, "CHANGE_PASSWORD", "重置用户 ID: "+strconv.FormatInt(targetID, 10)+" 的密码", c.ClientIP())
 	ok(c, gin.H{"updated": true})
 }
